@@ -1,0 +1,27 @@
+[package]
+name = "app-powerd-core"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["x11"]
+x11 = ["dep:x11rb"]
+wayland = ["dep:wayland-client", "dep:wayland-protocols-wlr"]
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+regex = { workspace = true }
+nix = { workspace = true }
+inotify = { workspace = true }
+x11rb = { workspace = true, optional = true }
+zbus = { workspace = true }
+wayland-client = { workspace = true, optional = true }
+wayland-protocols-wlr = { workspace = true, optional = true }
+async-trait = "0.1"
+tokio-stream = "0.1"
+humantime-serde = "1"

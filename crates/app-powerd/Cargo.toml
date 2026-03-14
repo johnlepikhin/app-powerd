@@ -1,0 +1,18 @@
+[package]
+name = "app-powerd"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "app-powerd"
+path = "src/main.rs"
+
+[dependencies]
+app-powerd-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+nix = { workspace = true }

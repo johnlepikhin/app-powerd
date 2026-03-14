@@ -1,0 +1,611 @@
+# app-powerd default configuration
+# ============================================================
+# User-level daemon for saving battery by managing background
+# GUI applications via cgroup v2 freeze/throttle.
+#
+# Matching: AND across fields, OR within lists.
+#   If both executable and wm_class are specified, BOTH must match.
+#   Use a single field per rule unless you need exact AND filtering.
+#
+# Rule order matters: first match wins.
+# ============================================================
+
+version: 1
+
+defaults:
+  enabled: true
+
+  mode:
+    ac: disable
+    battery: enable
+
+  timing:
+    suspend_delay: "30s"
+    resume_grace: "3s"
+    min_suspend: "5s"
+
+  maintenance_resume:
+    enabled: false
+    interval: "30s"
+    duration: "1s"
+
+  guards:
+    audio_active: check
+    mic_active: check
+    camera_active: check
+    fullscreen: check
+    # input_idle: "5m"  # uncomment to require idle before suspending
+
+# ============================================================
+# Profiles
+# ============================================================
+
+profiles:
+  # Never touch the app
+  ignore:
+    action: ignore
+
+  # Freeze completely (cgroup freeze / SIGSTOP)
+  freeze:
+    action: freeze
+    suspend_delay: "60s"
+
+  # Quick freeze for static viewers/file managers
+  freeze-fast:
+    action: freeze
+    suspend_delay: "20s"
+    guards:
+      audio_active: ignore
+      mic_active: ignore
+      camera_active: ignore
+      fullscreen: check
+
+  # Mild throttle: limit CPU but keep running
+  throttle:
+    action: throttle
+    suspend_delay: "30s"
+    nice: 5
+    cpu_weight: 20
+    cpu_quota: "40%"
+
+  # Editors/IDEs: keep LSP/indexation alive
+  editor:
+    action: throttle
+    suspend_delay: "45s"
+    nice: 5
+    cpu_weight: 50
+    cpu_quota: "50%"
+
+  # Browsers: they manage background tabs internally
+  browser:
+    action: throttle
+    suspend_delay: "30s"
+    nice: 5
+    cpu_weight: 20
+    cpu_quota: "40%"
+
+  # Messengers: freeze with periodic wake for notifications
+  messenger:
+    action: freeze
+    suspend_delay: "1m"
+    maintenance_resume:
+      enabled: true
+      interval: "30s"
+      duration: "3s"
+    guards:
+      audio_active: ignore
+
+  # Email: freeze with infrequent wake (not time-critical)
+  email:
+    action: freeze
+    suspend_delay: "3m"
+    maintenance_resume:
+      enabled: true
+      interval: "5m"
+      duration: "5s"
+
+  # Aggressive throttle: barely any CPU (static office docs, torrents)
+  throttle-aggressive:
+    action: throttle
+    suspend_delay: "30s"
+    nice: 19
+    cpu_weight: 1
+    cpu_quota: "5%"
+
+  # Background workers: rendering, heavy computation
+  background-worker:
+    action: throttle
+    suspend_delay: "60s"
+    nice: 10
+    cpu_weight: 10
+    cpu_quota: "25%"
+
+# ============================================================
+# Rules (first match wins)
+# ============================================================
+
+rules:
+  # ──────────────────────────────────────────────
+  # System utilities: ignore (tray apps, panels, WM components)
+  # Must be first — these should never be managed
+  # ──────────────────────────────────────────────
+  - id: i3-components
+    match:
+      executable: [i3bar, i3status, i3lock, i3-nagbar, polybar, waybar, sway, swaybg, swayidle, swaylock]
+    policy:
+      use_profile: ignore
+
+  - id: system-tray
+    match:
+      executable: [nm-applet, blueman-applet, blueman-tray, pasystray, udiskie, cbatticon, batsignal, trayer, stalonetray]
+    policy:
+      use_profile: ignore
+
+  - id: clipboard-managers
+    match:
+      executable: [clipman, clipmenu, clipcat, parcellite, copyq, gpaste-client, xclip, xsel, wl-copy, wl-paste]
+    policy:
+      use_profile: ignore
+
+  - id: notification-daemons
+    match:
+      executable: [dunst, mako, swaync, fnott, deadd-notification-center, xfce4-notifyd]
+    policy:
+      use_profile: ignore
+
+  - id: screenshot-tools
+    match:
+      executable: [flameshot, scrot, maim, grim, slurp, spectacle, gnome-screenshot, shutter, ksnip]
+    policy:
+      use_profile: ignore
+
+  - id: launchers
+    match:
+      executable: [rofi, dmenu, wofi, fuzzel, bemenu, albert, ulauncher, synapse]
+    policy:
+      use_profile: ignore
+
+  - id: compositors
+    match:
+      executable: [picom, compton, xcompmgr]
+    policy:
+      use_profile: ignore
+
+  # ──────────────────────────────────────────────
+  # Terminals: never suspend (active user interaction)
+  # ──────────────────────────────────────────────
+  - id: alacritty
+    match:
+      wm_class: [Alacritty]
+    policy:
+      use_profile: ignore
+
+  - id: terminals
+    match:
+      executable:
+        - kitty
+        - foot
+        - wezterm-gui
+        - st
+        - urxvt
+        - urxvtd
+        - xterm
+        - gnome-terminal-server
+        - konsole
+        - xfce4-terminal
+        - tilix
+        - terminator
+        - sakura
+        - lxterminal
+        - mate-terminal
+        - guake
+        - yakuake
+        - tilda
+    policy:
+      use_profile: ignore
+
+  # ──────────────────────────────────────────────
+  # Editors: throttle (background LSP/indexing useful)
+  # ──────────────────────────────────────────────
+  - id: emacs
+    match:
+      wm_class: [Emacs]
+    policy:
+      use_profile: editor
+
+  - id: neovim-gui
+    match:
+      executable: [neovide, gvim]
+    policy:
+      use_profile: editor
+
+  # ──────────────────────────────────────────────
+  # IDEs: throttle with generous CPU for indexing
+  # ──────────────────────────────────────────────
+  - id: vscode
+    match:
+      executable: [code, code-oss, codium]
+    policy:
+      use_profile: editor
+      cpu_quota: "60%"
+
+  - id: jetbrains
+    match:
+      cmdline_regex: "jetbrains|intellij|idea|pycharm|webstorm|clion|goland|rider|rustrover|datagrip|dataspell|phpstorm|fleet"
+    policy:
+      use_profile: editor
+      cpu_quota: "50%"
+
+  - id: zed
+    match:
+      executable: [zed]
+    policy:
+      use_profile: editor
+
+  # ──────────────────────────────────────────────
+  # Browsers: throttle (they manage background tabs internally)
+  # ──────────────────────────────────────────────
+  - id: chrome
+    match:
+      executable: [google-chrome, google-chrome-stable, google-chrome-beta, google-chrome-unstable, chromium, chromium-browser]
+    policy:
+      use_profile: browser
+
+  - id: firefox
+    match:
+      executable: [firefox, firefox-esr, firefox-developer-edition, librewolf, waterfox, floorp]
+    policy:
+      use_profile: browser
+
+  - id: brave
+    match:
+      executable: [brave, brave-browser]
+    policy:
+      use_profile: browser
+
+  - id: epiphany
+    match:
+      executable: [epiphany, epiphany-browser]
+    policy:
+      use_profile: browser
+
+  - id: vivaldi
+    match:
+      executable: [vivaldi, vivaldi-stable]
+    policy:
+      use_profile: browser
+
+  - id: opera
+    match:
+      executable: [opera]
+    policy:
+      use_profile: browser
+
+  # ──────────────────────────────────────────────
+  # Messengers: freeze with maintenance for notifications
+  # ──────────────────────────────────────────────
+  - id: telegram
+    match:
+      wm_class: [TelegramDesktop]
+    policy:
+      use_profile: messenger
+
+  - id: vkteams
+    match:
+      wm_class: [".vkteams-real"]
+    policy:
+      use_profile: messenger
+
+  - id: slack
+    match:
+      executable: [slack]
+    policy:
+      use_profile: messenger
+
+  - id: discord
+    match:
+      executable: [discord, Discord]
+    policy:
+      use_profile: messenger
+
+  - id: signal
+    match:
+      executable: [signal-desktop]
+    policy:
+      use_profile: messenger
+
+  - id: element
+    match:
+      executable: [element-desktop]
+    policy:
+      use_profile: messenger
+
+  - id: teams
+    match:
+      executable: [teams, teams-for-linux]
+    policy:
+      use_profile: messenger
+
+  - id: zoom
+    match:
+      executable: [zoom, ZoomLauncher]
+    policy:
+      use_profile: messenger
+
+  # ──────────────────────────────────────────────
+  # Email: freeze with infrequent maintenance wake
+  # ──────────────────────────────────────────────
+  - id: thunderbird
+    match:
+      executable: [thunderbird, thunderbird-esr]
+    policy:
+      use_profile: email
+
+  - id: evolution
+    match:
+      executable: [evolution]
+    policy:
+      use_profile: email
+
+  - id: geary
+    match:
+      executable: [geary]
+    policy:
+      use_profile: email
+
+  # ──────────────────────────────────────────────
+  # Media players: never suspend (audio/video playback)
+  # ──────────────────────────────────────────────
+  - id: smplayer
+    match:
+      wm_class: [Smplayer, smplayer]
+    policy:
+      use_profile: ignore
+
+  - id: media-players
+    match:
+      executable: [vlc, mpv, celluloid, totem, parole, mplayer, haruna, kaffeine, xplayer, dragon]
+    policy:
+      use_profile: ignore
+
+  - id: music-players
+    match:
+      executable:
+        - spotify
+        - rhythmbox
+        - lollypop
+        - amberol
+        - elisa
+        - clementine
+        - strawberry
+        - audacious
+        - deadbeef
+        - cmus
+        - quodlibet
+        - sayonara
+        - gnome-music
+    policy:
+      use_profile: ignore
+
+  - id: audio-production
+    match:
+      executable: [ardour, audacity, lmms, hydrogen, musescore, rosegarden, qtractor, zrythm, carla]
+    policy:
+      use_profile: ignore
+
+  # ──────────────────────────────────────────────
+  # Graphics / Design
+  # ──────────────────────────────────────────────
+  - id: gimp
+    match:
+      executable: [gimp, gimp-2.10, gimp-2.99]
+    policy:
+      use_profile: throttle
+      cpu_quota: "30%"
+
+  - id: inkscape
+    match:
+      executable: [inkscape]
+    policy:
+      use_profile: throttle
+      cpu_quota: "30%"
+
+  - id: krita
+    match:
+      executable: [krita]
+    policy:
+      use_profile: throttle
+      cpu_quota: "30%"
+
+  # Never freeze — may be rendering
+  - id: blender
+    match:
+      executable: [blender]
+    policy:
+      use_profile: ignore
+
+  - id: obs
+    match:
+      executable: [obs, obs-studio]
+    policy:
+      use_profile: ignore
+
+  # Heavy background processing
+  - id: kdenlive
+    match:
+      executable: [kdenlive]
+    policy:
+      use_profile: background-worker
+
+  - id: darktable
+    match:
+      executable: [darktable, rawtherapee, digikam]
+    policy:
+      use_profile: background-worker
+
+  # ──────────────────────────────────────────────
+  # Office / Documents: aggressive throttle
+  # ──────────────────────────────────────────────
+  - id: libreoffice
+    match:
+      cmdline_regex: "soffice|libreoffice"
+    policy:
+      use_profile: throttle-aggressive
+
+  - id: onlyoffice
+    match:
+      executable: [onlyoffice-desktopeditors, DesktopEditors]
+    policy:
+      use_profile: throttle-aggressive
+
+  # ──────────────────────────────────────────────
+  # Viewers: freeze fast (static content)
+  # ──────────────────────────────────────────────
+  - id: pdf-viewers
+    match:
+      executable: [evince, okular, zathura, mupdf, xreader, atril, qpdfview, sioyek]
+    policy:
+      use_profile: freeze-fast
+
+  - id: ebook-readers
+    match:
+      executable: [calibre, calibre-gui, foliate, fbreader]
+    policy:
+      use_profile: freeze-fast
+
+  - id: image-viewers
+    match:
+      executable: [eog, eom, feh, sxiv, nsxiv, imv, ristretto, shotwell, gthumb, gwenview, nomacs, loupe]
+    policy:
+      use_profile: freeze-fast
+
+  # ──────────────────────────────────────────────
+  # File managers: freeze fast
+  # ──────────────────────────────────────────────
+  - id: file-managers
+    match:
+      executable: [nautilus, thunar, pcmanfm, pcmanfm-qt, nemo, caja, dolphin, konqueror, spacefm, krusader, mc]
+    policy:
+      use_profile: freeze-fast
+
+  # ──────────────────────────────────────────────
+  # Virtual machines: never suspend (guest OS running)
+  # ──────────────────────────────────────────────
+  - id: virt-manager
+    match:
+      executable: [virt-manager, virt-viewer, remote-viewer]
+    policy:
+      use_profile: ignore
+
+  - id: qemu
+    match:
+      cmdline_regex: "qemu-system"
+    policy:
+      use_profile: ignore
+
+  - id: virtualbox
+    match:
+      executable: [VirtualBox, VirtualBoxVM, VBoxHeadless]
+    policy:
+      use_profile: ignore
+
+  - id: gnome-boxes
+    match:
+      executable: [gnome-boxes]
+    policy:
+      use_profile: ignore
+
+  # ──────────────────────────────────────────────
+  # Remote desktop: never suspend (active remote session)
+  # ──────────────────────────────────────────────
+  - id: remote-desktop
+    match:
+      executable: [remmina, xfreerdp, vncviewer, vinagre, rustdesk, anydesk, krdc, tigervnc]
+    policy:
+      use_profile: ignore
+
+  # ──────────────────────────────────────────────
+  # Database / API clients: throttle gently
+  # ──────────────────────────────────────────────
+  - id: db-clients
+    match:
+      executable: [dbeaver, pgadmin4, beekeeper-studio, dbgate]
+    policy:
+      use_profile: throttle
+      cpu_quota: "20%"
+
+  - id: api-clients
+    match:
+      executable: [insomnia, postman, hoppscotch]
+    policy:
+      use_profile: throttle
+      cpu_quota: "20%"
+
+  # ──────────────────────────────────────────────
+  # Settings / Control panels: freeze fast
+  # ──────────────────────────────────────────────
+  - id: settings
+    match:
+      executable:
+        - gnome-control-center
+        - pavucontrol
+        - blueman-manager
+        - lxappearance
+        - qt5ct
+        - qt6ct
+        - arandr
+        - xfce4-settings-manager
+        - systemsettings
+        - gnome-tweaks
+    policy:
+      use_profile: freeze-fast
+
+  # ──────────────────────────────────────────────
+  # Torrent / Download clients: aggressive throttle
+  # ──────────────────────────────────────────────
+  - id: torrent-clients
+    match:
+      executable: [transmission-gtk, transmission-qt, qbittorrent, deluge, deluge-gtk, fragments]
+    policy:
+      use_profile: throttle-aggressive
+
+  # ──────────────────────────────────────────────
+  # Gaming: never suspend
+  # ──────────────────────────────────────────────
+  - id: steam
+    match:
+      executable: [steam, steamwebhelper]
+    policy:
+      use_profile: ignore
+
+  - id: game-launchers
+    match:
+      executable: [lutris, heroic, gamescope, mangohud]
+    policy:
+      use_profile: ignore
+
+  - id: wine-proton
+    match:
+      cmdline_regex: "wine|proton"
+    policy:
+      use_profile: ignore
+
+  # ──────────────────────────────────────────────
+  # CAD / 3D / Engineering: never suspend (may be computing)
+  # ──────────────────────────────────────────────
+  - id: cad-3d
+    match:
+      executable: [freecad, openscad, prusa-slicer, PrusaSlicer, cura, kicad, kicad-wayland]
+    policy:
+      use_profile: ignore
+
+  # ──────────────────────────────────────────────
+  # Electron generic fallback: throttle
+  # Must be near the end — specific Electron apps above override this
+  # ──────────────────────────────────────────────
+  - id: electron-generic
+    match:
+      cmdline_regex: "electron"
+    policy:
+      use_profile: throttle
+      cpu_quota: "30%"
