@@ -2,6 +2,15 @@
 name = "app-powerd"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "User-level daemon that saves battery by freezing/throttling unfocused GUI apps"
+readme = "../../README.md"
+keywords = ["battery", "power-management", "cgroup", "linux", "daemon"]
+categories = ["os::linux-apis", "command-line-utilities"]
+exclude = ["CLAUDE.md", ".claude/"]
 
 [[bin]]
 name = "app-powerd"
@@ -16,3 +25,6 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 nix = { workspace = true }
+
+[lints]
+workspace = true

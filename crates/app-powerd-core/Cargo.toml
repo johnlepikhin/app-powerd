@@ -2,6 +2,15 @@
 name = "app-powerd-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core library for app-powerd: battery-saving background app management"
+readme = "../../README.md"
+keywords = ["battery", "power-management", "cgroup", "linux", "daemon"]
+categories = ["os::linux-apis", "command-line-utilities"]
+exclude = ["CLAUDE.md", ".claude/"]
 
 [features]
 default = ["x11"]
@@ -25,3 +34,6 @@ wayland-protocols-wlr = { workspace = true, optional = true }
 async-trait = "0.1"
 tokio-stream = "0.1"
 humantime-serde = "1"
+
+[lints]
+workspace = true
