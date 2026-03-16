@@ -16,14 +16,18 @@ exclude = ["CLAUDE.md", ".claude/"]
 name = "app-powerd"
 path = "src/main.rs"
 
+[features]
+default = ["x11"]
+x11 = ["app-powerd-core/x11"]
+wayland = ["app-powerd-core/wayland"]
+
 [dependencies]
-app-powerd-core = { workspace = true }
+app-powerd-core = { workspace = true, default-features = false }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-serde_json = { workspace = true }
 nix = { workspace = true }
 
 [lints]
