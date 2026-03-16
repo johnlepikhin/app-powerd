@@ -4,8 +4,13 @@ use tracing::{debug, info, warn};
 use zbus::blocking::Connection;
 use zbus::zvariant::{OwnedValue, Value};
 
+use super::{cgroup_base_path, sanitize_unit_name};
 use crate::error::SystemError;
-use super::{sanitize_unit_name, cgroup_base_path};
+
+const SYSTEMD_BUS: &str = "org.freedesktop.systemd1";
+const SYSTEMD_PATH: &str = "/org/freedesktop/systemd1";
+const SYSTEMD_MANAGER_IFACE: &str = "org.freedesktop.systemd1.Manager";
+const DBUS_PROPERTIES_IFACE: &str = "org.freedesktop.DBus.Properties";
 
 /// Manages systemd transient scopes via D-Bus.
 pub struct SystemdManager {
@@ -20,11 +25,11 @@ impl SystemdManager {
         // Probe systemd version to verify it's reachable
         let reply = conn
             .call_method(
-                Some("org.freedesktop.systemd1"),
-                "/org/freedesktop/systemd1",
-                Some("org.freedesktop.DBus.Properties"),
+                Some(SYSTEMD_BUS),
+                SYSTEMD_PATH,
+                Some(DBUS_PROPERTIES_IFACE),
                 "Get",
-                &("org.freedesktop.systemd1.Manager", "Version"),
+                &(SYSTEMD_MANAGER_IFACE, "Version"),
             )
             .ok()?;
 
@@ -47,18 +52,24 @@ impl SystemdManager {
         // Build properties array for StartTransientUnit
         // Properties: Description (s), PIDs (au)
         let desc_prop = ("Description", Value::from(description));
-        let pids_prop = ("PIDs", Value::Array(
-            pids.iter().map(|&p| Value::from(p)).collect::<Vec<_>>().into(),
-        ));
+        let pids_prop = (
+            "PIDs",
+            Value::Array(
+                pids.iter()
+                    .map(|&p| Value::from(p))
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+        );
         let properties: Vec<(&str, Value<'_>)> = vec![desc_prop, pids_prop];
 
         // aux: array of (unit_name, array of properties) — empty for us
         let aux: Vec<(&str, Vec<(&str, Value<'_>)>)> = vec![];
 
         match self.conn.call_method(
-            Some("org.freedesktop.systemd1"),
-            "/org/freedesktop/systemd1",
-            Some("org.freedesktop.systemd1.Manager"),
+            Some(SYSTEMD_BUS),
+            SYSTEMD_PATH,
+            Some(SYSTEMD_MANAGER_IFACE),
             "StartTransientUnit",
             &(&scope_name, "fail", &properties, &aux),
         ) {

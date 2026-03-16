@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Core library for [`app-powerd`](https://github.com/johnlepikhin/app-powerd) —
 //! a user-level Linux daemon that saves battery by automatically freezing and
 //! throttling unfocused GUI applications via cgroup v2.
@@ -26,4 +28,3 @@ pub mod ipc;
 pub mod metrics;
 pub mod state;
 pub mod system;
-

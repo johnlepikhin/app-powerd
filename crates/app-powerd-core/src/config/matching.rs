@@ -7,7 +7,7 @@ use crate::error::ConfigError;
 
 /// Pre-compiled rule for efficient matching.
 #[derive(Debug)]
-pub struct CompiledRule {
+pub(crate) struct CompiledRule {
     pub id: String,
     pub executables: Vec<String>,
     pub wm_classes: Vec<String>,
@@ -32,12 +32,12 @@ pub struct MatchContext {
 impl From<&WindowInfo> for MatchContext {
     fn from(w: &WindowInfo) -> Self {
         Self {
-            executable: w.executable.clone().unwrap_or_default(),
-            cmdline: w.cmdline.clone().unwrap_or_default(),
-            wm_class: w.wm_class.clone().unwrap_or_default(),
-            app_id: w.app_id.clone().unwrap_or_default(),
+            executable: w.executable.as_deref().unwrap_or_default().to_owned(),
+            cmdline: w.cmdline.as_deref().unwrap_or_default().to_owned(),
+            wm_class: w.wm_class.as_deref().unwrap_or_default().to_owned(),
+            app_id: w.app_id.as_deref().unwrap_or_default().to_owned(),
             desktop_file: String::new(),
-            window_title: w.title.clone().unwrap_or_default(),
+            window_title: w.title.as_deref().unwrap_or_default().to_owned(),
         }
     }
 }
@@ -65,7 +65,9 @@ impl RulesEngine {
         for rule in &self.compiled {
             if matches_rule(rule, ctx) {
                 debug!(rule_id = %rule.id, "rule matched");
-                return self.config.resolve_policy(&self.config.rules[rule.policy_index].policy);
+                return self
+                    .config
+                    .resolve_policy(&self.config.rules[rule.policy_index].policy);
             }
         }
 
@@ -76,6 +78,24 @@ impl RulesEngine {
     pub fn config(&self) -> &Config {
         &self.config
     }
+}
+
+fn compile_optional_regex(
+    pattern: &Option<String>,
+    rule_id: &str,
+) -> Result<Option<Regex>, ConfigError> {
+    pattern
+        .as_ref()
+        .map(|r| {
+            regex::RegexBuilder::new(r)
+                .size_limit(64 * 1024)
+                .build()
+                .map_err(|e| ConfigError::InvalidRegex {
+                    rule_id: rule_id.to_owned(),
+                    source: e,
+                })
+        })
+        .transpose()
 }
 
 fn compile_rule(rule: &Rule, index: usize) -> Result<CompiledRule, ConfigError> {
@@ -90,29 +110,8 @@ fn compile_rule(rule: &Rule, index: usize) -> Result<CompiledRule, ConfigError> 
         warn!(rule_id = %rule.id, "rule has empty match criteria — will match all windows (catch-all)");
     }
 
-    let cmdline_regex = rule
-        .match_criteria
-        .cmdline_regex
-        .as_ref()
-        .map(|r| {
-            Regex::new(r).map_err(|e| ConfigError::InvalidRegex {
-                rule_id: rule.id.clone(),
-                source: e,
-            })
-        })
-        .transpose()?;
-
-    let window_title_regex = rule
-        .match_criteria
-        .window_title_regex
-        .as_ref()
-        .map(|r| {
-            Regex::new(r).map_err(|e| ConfigError::InvalidRegex {
-                rule_id: rule.id.clone(),
-                source: e,
-            })
-        })
-        .transpose()?;
+    let cmdline_regex = compile_optional_regex(&mc.cmdline_regex, &rule.id)?;
+    let window_title_regex = compile_optional_regex(&mc.window_title_regex, &rule.id)?;
 
     Ok(CompiledRule {
         id: rule.id.clone(),
@@ -128,26 +127,19 @@ fn compile_rule(rule: &Rule, index: usize) -> Result<CompiledRule, ConfigError> 
 
 /// AND across fields, OR within field values.
 fn matches_rule(rule: &CompiledRule, ctx: &MatchContext) -> bool {
-    if !rule.executables.is_empty()
-        && !rule.executables.iter().any(|e| e == &ctx.executable)
-    {
+    if !rule.executables.is_empty() && !rule.executables.iter().any(|e| e == &ctx.executable) {
         return false;
     }
 
-    if !rule.wm_classes.is_empty()
-        && !rule.wm_classes.iter().any(|c| c == &ctx.wm_class)
-    {
+    if !rule.wm_classes.is_empty() && !rule.wm_classes.iter().any(|c| c == &ctx.wm_class) {
         return false;
     }
 
-    if !rule.app_ids.is_empty()
-        && !rule.app_ids.iter().any(|a| a == &ctx.app_id)
-    {
+    if !rule.app_ids.is_empty() && !rule.app_ids.iter().any(|a| a == &ctx.app_id) {
         return false;
     }
 
-    if !rule.desktop_files.is_empty()
-        && !rule.desktop_files.iter().any(|d| d == &ctx.desktop_file)
+    if !rule.desktop_files.is_empty() && !rule.desktop_files.iter().any(|d| d == &ctx.desktop_file)
     {
         return false;
     }
@@ -173,12 +165,13 @@ mod tests {
     use crate::config::Config;
 
     fn make_config(yaml: &str) -> Config {
-        serde_yaml::from_str(yaml).unwrap()
+        serde_yaml_ng::from_str(yaml).unwrap()
     }
 
     #[test]
     fn first_match_wins() {
-        let config = make_config(r#"
+        let config = make_config(
+            r#"
 version: 1
 profiles:
   freeze:
@@ -195,7 +188,8 @@ rules:
     match: {}
     policy:
       use_profile: freeze
-"#);
+"#,
+        );
         let engine = RulesEngine::new(config).unwrap();
 
         let ctx = MatchContext {
@@ -208,7 +202,8 @@ rules:
 
     #[test]
     fn regex_match() {
-        let config = make_config(r#"
+        let config = make_config(
+            r#"
 version: 1
 rules:
   - id: electron
@@ -216,7 +211,8 @@ rules:
       cmdline_regex: "--type=renderer"
     policy:
       action: throttle
-"#);
+"#,
+        );
         let engine = RulesEngine::new(config).unwrap();
 
         let ctx = MatchContext {
@@ -229,7 +225,8 @@ rules:
 
     #[test]
     fn and_across_fields() {
-        let config = make_config(r#"
+        let config = make_config(
+            r#"
 version: 1
 rules:
   - id: specific
@@ -237,8 +234,9 @@ rules:
       executable: [firefox]
       wm_class: [Navigator]
     policy:
-      action: freeze
-"#);
+      action: throttle
+"#,
+        );
         let engine = RulesEngine::new(config).unwrap();
 
         // Only executable matches — should NOT match (AND logic)
@@ -248,16 +246,16 @@ rules:
             ..Default::default()
         };
         let policy = engine.match_window(&ctx);
-        // Falls through to default
+        // Falls through to default which is Freeze, NOT Throttle
         assert_eq!(policy.action, crate::config::Action::Freeze);
-        // But it's the DEFAULT freeze, not the rule's freeze — hard to distinguish here
-        // Let's test that both fields matching works
+
+        // Both fields match — should match the rule (Throttle)
         let ctx2 = MatchContext {
             executable: "firefox".into(),
             wm_class: "Navigator".into(),
             ..Default::default()
         };
         let policy2 = engine.match_window(&ctx2);
-        assert_eq!(policy2.action, crate::config::Action::Freeze);
+        assert_eq!(policy2.action, crate::config::Action::Throttle);
     }
 }

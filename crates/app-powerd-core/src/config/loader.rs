@@ -26,7 +26,7 @@ pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
     }
 
     let content = std::fs::read_to_string(path)?;
-    let config: Config = serde_yaml::from_str(&content)?;
+    let config: Config = serde_yaml_ng::from_str(&content)?;
     validate(&config)?;
 
     info!(path = %path.display(), "config loaded");
@@ -75,6 +75,74 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
         // and validates all regexes during rule compilation.
     }
 
+    // Check for duplicate rule IDs
+    let mut seen_ids = std::collections::HashSet::new();
+    for rule in &config.rules {
+        if !seen_ids.insert(&rule.id) {
+            return Err(ConfigError::Validation {
+                message: format!("duplicate rule id: '{}'", rule.id),
+            });
+        }
+    }
+
+    // Validate numeric ranges in profiles
+    for (name, profile) in &config.profiles {
+        validate_throttle_params(
+            &format!("profile '{name}'"),
+            profile.nice,
+            profile.cpu_weight,
+            profile.cpu_quota.as_deref(),
+        )?;
+    }
+
+    // Validate numeric ranges in rule policies
+    for rule in &config.rules {
+        validate_throttle_params(
+            &format!("rule '{}'", rule.id),
+            rule.policy.nice,
+            rule.policy.cpu_weight,
+            rule.policy.cpu_quota.as_deref(),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_throttle_params(
+    ctx: &str,
+    nice: Option<i32>,
+    cpu_weight: Option<u32>,
+    cpu_quota: Option<&str>,
+) -> Result<(), ConfigError> {
+    if let Some(nice) = nice {
+        if !(-20..=19).contains(&nice) {
+            return Err(ConfigError::Validation {
+                message: format!("{ctx}: nice must be in -20..19, got {nice}"),
+            });
+        }
+    }
+    if let Some(weight) = cpu_weight {
+        if !(1..=10000).contains(&weight) {
+            return Err(ConfigError::Validation {
+                message: format!("{ctx}: cpu_weight must be in 1..10000, got {weight}"),
+            });
+        }
+    }
+    if let Some(quota) = cpu_quota {
+        let numeric = quota.strip_suffix('%').unwrap_or(quota);
+        let value = numeric
+            .parse::<u32>()
+            .map_err(|_| ConfigError::Validation {
+                message: format!(
+                    "{ctx}: cpu_quota must be a number with optional '%' suffix, got '{quota}'"
+                ),
+            })?;
+        if !(1..=100).contains(&value) {
+            return Err(ConfigError::Validation {
+                message: format!("{ctx}: cpu_quota must be in 1..=100, got {value}"),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -90,9 +158,7 @@ impl Default for Config {
 }
 
 /// Watch config file for changes using inotify. Returns an async stream.
-pub async fn watch_config(
-    path: &Path,
-) -> Result<tokio::sync::mpsc::Receiver<()>, ConfigError> {
+pub async fn watch_config(path: &Path) -> Result<tokio::sync::mpsc::Receiver<()>, ConfigError> {
     let (tx, rx) = tokio::sync::mpsc::channel(4);
 
     let dir = path
@@ -133,4 +199,120 @@ pub async fn watch_config(
     });
 
     Ok(rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, MatchCriteria, PolicyConfig, Rule};
+
+    #[test]
+    fn validate_rejects_wrong_version() {
+        let mut config = Config::default();
+        config.version = 2;
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_rule_id() {
+        let mut config = Config::default();
+        config.rules.push(Rule {
+            id: String::new(),
+            match_criteria: MatchCriteria {
+                executable: vec!["test".into()],
+                cmdline_regex: None,
+                wm_class: vec![],
+                app_id: vec![],
+                desktop_file: vec![],
+                window_title_regex: None,
+            },
+            policy: PolicyConfig {
+                use_profile: None,
+                action: None,
+                suspend_delay: None,
+                nice: None,
+                cpu_weight: None,
+                cpu_quota: None,
+                maintenance_resume: None,
+                guards: None,
+            },
+        });
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_profile() {
+        let mut config = Config::default();
+        config.rules.push(Rule {
+            id: "test".into(),
+            match_criteria: MatchCriteria {
+                executable: vec!["test".into()],
+                cmdline_regex: None,
+                wm_class: vec![],
+                app_id: vec![],
+                desktop_file: vec![],
+                window_title_regex: None,
+            },
+            policy: PolicyConfig {
+                use_profile: Some("nonexistent".into()),
+                action: None,
+                suspend_delay: None,
+                nice: None,
+                cpu_weight: None,
+                cpu_quota: None,
+                maintenance_resume: None,
+                guards: None,
+            },
+        });
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_valid_config() {
+        let config = Config::default();
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn load_config_or_default_returns_defaults() {
+        let config = load_config_or_default(Path::new("/nonexistent/path/config.yaml"));
+        assert_eq!(config.version, 1);
+        assert!(config.defaults.enabled);
+    }
+
+    #[test]
+    fn nice_boundary_values() {
+        // -20 is the valid minimum
+        assert!(validate_throttle_params("ctx", Some(-20), None, None).is_ok());
+        // -21 is below minimum
+        assert!(validate_throttle_params("ctx", Some(-21), None, None).is_err());
+        // 19 is the valid maximum
+        assert!(validate_throttle_params("ctx", Some(19), None, None).is_ok());
+        // 20 is above maximum
+        assert!(validate_throttle_params("ctx", Some(20), None, None).is_err());
+    }
+
+    #[test]
+    fn cpu_weight_boundary_values() {
+        // 0 is below minimum
+        assert!(validate_throttle_params("ctx", None, Some(0), None).is_err());
+        // 1 is the valid minimum
+        assert!(validate_throttle_params("ctx", None, Some(1), None).is_ok());
+        // 10000 is the valid maximum
+        assert!(validate_throttle_params("ctx", None, Some(10000), None).is_ok());
+        // 10001 is above maximum
+        assert!(validate_throttle_params("ctx", None, Some(10001), None).is_err());
+    }
+
+    #[test]
+    fn cpu_quota_boundary_values() {
+        // "0%" is below minimum (1%)
+        assert!(validate_throttle_params("ctx", None, None, Some("0%")).is_err());
+        // "1%" is the valid minimum
+        assert!(validate_throttle_params("ctx", None, None, Some("1%")).is_ok());
+        // "100%" is the valid maximum
+        assert!(validate_throttle_params("ctx", None, None, Some("100%")).is_ok());
+        // "101%" is above maximum
+        assert!(validate_throttle_params("ctx", None, None, Some("101%")).is_err());
+    }
 }

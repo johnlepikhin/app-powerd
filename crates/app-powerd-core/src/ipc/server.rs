@@ -1,16 +1,21 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use tokio::net::UnixListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info};
 
 use super::protocol::{self, IpcRequest, IpcResponse};
 use crate::engine::EngineEvent;
 
+/// Maximum number of concurrent IPC connections.
+const MAX_CONCURRENT_CONNECTIONS: usize = 32;
+
 /// IPC server that listens on a Unix socket and forwards requests to the engine.
 pub struct IpcServer {
     listener: UnixListener,
     engine_tx: mpsc::Sender<EngineEvent>,
+    max_connections: Arc<Semaphore>,
 }
 
 impl IpcServer {
@@ -31,6 +36,7 @@ impl IpcServer {
         Ok(Self {
             listener,
             engine_tx,
+            max_connections: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         })
     }
 
@@ -40,10 +46,15 @@ impl IpcServer {
             match self.listener.accept().await {
                 Ok((stream, _)) => {
                     let engine_tx = self.engine_tx.clone();
+                    let permit = match self.max_connections.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => break, // semaphore closed
+                    };
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(stream, engine_tx).await {
                             debug!(error = %e, "IPC connection error");
                         }
+                        drop(permit);
                     });
                 }
                 Err(e) => {
@@ -71,11 +82,9 @@ async fn handle_connection(
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "engine gone"))?;
 
-    let response = reply_rx
-        .await
-        .unwrap_or(IpcResponse::Error {
-            message: "engine did not respond".into(),
-        });
+    let response = reply_rx.await.unwrap_or(IpcResponse::Error {
+        message: "engine did not respond".into(),
+    });
 
     protocol::write_message(&mut stream, &response).await?;
     Ok(())

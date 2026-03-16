@@ -1,7 +1,7 @@
-pub mod machine;
-pub mod app_entry;
-pub mod registry;
+pub(crate) mod app_entry;
+pub(crate) mod machine;
+pub(crate) mod registry;
 
-pub use machine::AppState;
 pub use app_entry::{AppEntry, AppId};
+pub use machine::{AppState, SuspendMode, TransitionAction};
 pub use registry::AppRegistry;

@@ -1,12 +1,13 @@
-pub mod window;
+pub(crate) mod window;
 
 #[cfg(feature = "x11")]
 pub mod x11;
 
 pub mod wayland;
 
+pub use window::WindowInfo;
+
 use tokio::sync::mpsc;
-use window::WindowInfo;
 
 /// Events emitted by focus backends.
 #[derive(Debug, Clone)]
@@ -21,10 +22,10 @@ pub enum FocusEvent {
 #[async_trait::async_trait]
 pub trait FocusBackend: Send {
     /// Start monitoring and send events to the channel.
-    async fn run(self: Box<Self>, tx: mpsc::Sender<FocusEvent>) -> Result<(), crate::error::DesktopError>;
-
-    /// Check if a window is fullscreen.
-    fn is_fullscreen(&self, window_id: u64) -> bool;
+    async fn run(
+        self: Box<Self>,
+        tx: mpsc::Sender<FocusEvent>,
+    ) -> Result<(), crate::error::DesktopError>;
 }
 
 /// Auto-detect and create the appropriate backend.
@@ -47,7 +48,7 @@ pub fn detect_backend() -> Result<Box<dyn FocusBackend>, crate::error::DesktopEr
         }
         #[cfg(not(feature = "x11"))]
         {
-            tracing::warn!("X11 detected but x11 feature not enabled");
+            tracing::warn!("X11 detected but x11 feature not enabled. Rebuild with --features x11 to enable X11 support");
         }
     }
 

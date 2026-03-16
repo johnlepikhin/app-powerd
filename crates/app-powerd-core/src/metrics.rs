@@ -53,6 +53,7 @@ impl Metrics {
 
 /// Serializable snapshot of metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsSnapshot {
     pub apps_frozen_total: u64,
     pub apps_thawed_total: u64,

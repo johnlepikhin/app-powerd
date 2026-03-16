@@ -29,8 +29,8 @@ impl AppRegistry {
 
     /// Insert or update an app entry. Returns the AppId.
     pub fn insert(&mut self, entry: AppEntry) -> AppId {
-        let app_id = entry.app_id.clone();
-        for &wid in &entry.window_ids {
+        let app_id = entry.app_id().clone();
+        for &wid in entry.window_ids() {
             self.window_map.insert(wid, app_id.clone());
         }
         self.apps.insert(app_id.clone(), entry);
@@ -73,5 +73,71 @@ impl AppRegistry {
 impl Default for AppRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ResolvedPolicy;
+    use crate::desktop::window::WindowInfo;
+    use crate::state::app_entry::AppEntry;
+
+    fn make_entry(app_id_str: &str, window_id: u64) -> AppEntry {
+        let mut info = WindowInfo::new(window_id);
+        info.wm_class = Some(app_id_str.to_string());
+        let app_id = AppId::from_window(&info);
+        AppEntry::new(app_id, info, ResolvedPolicy::default())
+    }
+
+    #[test]
+    fn insert_and_get() {
+        let mut reg = AppRegistry::new();
+        let entry = make_entry("firefox", 1);
+        let id = reg.insert(entry);
+        assert!(reg.get(&id).is_some());
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn two_windows_same_app_remove_one() {
+        let mut reg = AppRegistry::new();
+        let mut entry = make_entry("firefox", 1);
+        entry.add_window(2);
+        let _id = reg.insert(entry);
+        // Removing first window should NOT remove the app
+        assert!(reg.remove_window(1).is_none());
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn remove_last_window_removes_app() {
+        let mut reg = AppRegistry::new();
+        let entry = make_entry("firefox", 1);
+        reg.insert(entry);
+        let removed = reg.remove_window(1);
+        assert!(removed.is_some());
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn remove_unknown_window() {
+        let mut reg = AppRegistry::new();
+        assert!(reg.remove_window(999).is_none());
+    }
+
+    #[test]
+    fn window_map_consistency() {
+        let mut reg = AppRegistry::new();
+        let mut entry = make_entry("app", 10);
+        entry.add_window(20);
+        reg.insert(entry);
+
+        reg.remove_window(10); // app still has window 20
+        assert_eq!(reg.len(), 1);
+
+        let removed = reg.remove_window(20); // last window
+        assert!(removed.is_some());
+        assert_eq!(reg.len(), 0);
     }
 }

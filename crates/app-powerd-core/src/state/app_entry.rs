@@ -18,8 +18,9 @@ impl AppId {
         let id = info
             .wm_class
             .as_deref()
-            .or(info.app_id.as_deref())
-            .or(info.executable.as_deref())
+            .filter(|s| !s.is_empty())
+            .or_else(|| info.app_id.as_deref().filter(|s| !s.is_empty()))
+            .or_else(|| info.executable.as_deref().filter(|s| !s.is_empty()))
             .map(String::from)
             .unwrap_or_else(|| format!("window-{}", info.window_id));
         AppId(id)
@@ -38,23 +39,23 @@ impl std::fmt::Display for AppId {
 
 /// Tracked application entry in the registry.
 pub struct AppEntry {
-    pub app_id: AppId,
-    pub state: AppState,
-    pub pids: Vec<u32>,
-    pub window_ids: Vec<u64>,
-    pub window_info: WindowInfo,
-    pub policy: ResolvedPolicy,
-    pub cgroup_path: Option<String>,
+    pub(crate) app_id: AppId,
+    pub(crate) state: AppState,
+    pub(crate) pids: Vec<u32>,
+    pub(crate) window_ids: Vec<u64>,
+    pub(crate) window_info: WindowInfo,
+    pub(crate) policy: ResolvedPolicy,
+    pub(crate) cgroup_path: Option<std::path::PathBuf>,
 
     /// When the app entered its current state.
-    pub state_since: Instant,
+    pub(crate) state_since: Instant,
     /// When the app was last active (for resume_grace).
-    pub last_active: Instant,
+    pub(crate) last_active: Instant,
 
     /// Handle for the suspend_delay timer task (can be aborted).
-    pub suspend_timer: Option<JoinHandle<()>>,
+    pub(crate) suspend_timer: Option<JoinHandle<()>>,
     /// Handle for the maintenance resume timer task.
-    pub maintenance_timer: Option<JoinHandle<()>>,
+    pub(crate) maintenance_timer: Option<JoinHandle<()>>,
 }
 
 impl AppEntry {
@@ -77,7 +78,80 @@ impl AppEntry {
         }
     }
 
+    // --- Read-only accessors ---
+
+    pub fn app_id(&self) -> &AppId {
+        &self.app_id
+    }
+
+    pub fn state(&self) -> AppState {
+        self.state
+    }
+
+    pub fn state_since(&self) -> Instant {
+        self.state_since
+    }
+
+    pub fn pids(&self) -> &[u32] {
+        &self.pids
+    }
+
+    pub fn policy(&self) -> &ResolvedPolicy {
+        &self.policy
+    }
+
+    pub fn window_info(&self) -> &WindowInfo {
+        &self.window_info
+    }
+
+    pub fn window_ids(&self) -> &[u64] {
+        &self.window_ids
+    }
+
+    pub fn cgroup_path_buf(&self) -> Option<std::path::PathBuf> {
+        self.cgroup_path.clone()
+    }
+
+    // --- Mutating methods ---
+
+    pub fn add_pid(&mut self, pid: u32) {
+        if !self.pids.contains(&pid) {
+            self.pids.push(pid);
+        }
+    }
+
+    pub fn contains_pid(&self, pid: u32) -> bool {
+        self.pids.contains(&pid)
+    }
+
+    pub fn update_window_info(&mut self, info: WindowInfo) {
+        self.window_info = info;
+    }
+
+    pub fn set_suspend_timer(&mut self, handle: JoinHandle<()>) {
+        self.cancel_suspend_timer();
+        self.suspend_timer = Some(handle);
+    }
+
+    pub fn set_maintenance_timer(&mut self, handle: JoinHandle<()>) {
+        self.cancel_maintenance_timer();
+        self.maintenance_timer = Some(handle);
+    }
+
+    pub fn set_cgroup_path(&mut self, path: std::path::PathBuf) {
+        self.cgroup_path = Some(path);
+    }
+
+    pub fn set_policy(&mut self, policy: ResolvedPolicy) {
+        self.policy = policy;
+    }
+
     /// Update state and record timestamp.
+    /// Reset `state_since` to now (for maintenance wake/sleep duration tracking).
+    pub fn reset_state_since(&mut self) {
+        self.state_since = Instant::now();
+    }
+
     pub fn set_state(&mut self, new_state: AppState) {
         let now = Instant::now();
         if new_state == AppState::Active {
@@ -109,7 +183,7 @@ impl AppEntry {
 
     /// Get the cgroup path as a `&Path`, if set.
     pub fn cgroup_path_ref(&self) -> Option<&Path> {
-        self.cgroup_path.as_deref().map(Path::new)
+        self.cgroup_path.as_deref()
     }
 
     /// Check if resume_grace period has not expired yet.
@@ -133,5 +207,60 @@ impl AppEntry {
     pub fn remove_window(&mut self, window_id: u64) -> bool {
         self.window_ids.retain(|&id| id != window_id);
         self.window_ids.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ResolvedPolicy;
+    use crate::desktop::window::WindowInfo;
+
+    #[test]
+    fn app_id_from_window_prefers_wm_class() {
+        let mut info = WindowInfo::new(1);
+        info.wm_class = Some("Firefox".into());
+        info.app_id = Some("org.mozilla.Firefox".into());
+        info.executable = Some("firefox".into());
+        assert_eq!(AppId::from_window(&info).as_str(), "Firefox");
+    }
+
+    #[test]
+    fn app_id_from_window_falls_back_to_app_id() {
+        let mut info = WindowInfo::new(1);
+        info.app_id = Some("org.mozilla.Firefox".into());
+        info.executable = Some("firefox".into());
+        assert_eq!(AppId::from_window(&info).as_str(), "org.mozilla.Firefox");
+    }
+
+    #[test]
+    fn app_id_from_window_falls_back_to_executable() {
+        let mut info = WindowInfo::new(1);
+        info.executable = Some("firefox".into());
+        assert_eq!(AppId::from_window(&info).as_str(), "firefox");
+    }
+
+    #[test]
+    fn app_id_from_window_falls_back_to_window_id() {
+        let info = WindowInfo::new(42);
+        assert_eq!(AppId::from_window(&info).as_str(), "window-42");
+    }
+
+    #[test]
+    fn add_window_dedup() {
+        let info = WindowInfo::new(1);
+        let mut entry = AppEntry::new(AppId::from_window(&info), info, ResolvedPolicy::default());
+        entry.add_window(1); // duplicate
+        entry.add_window(2);
+        assert_eq!(entry.window_ids().len(), 2);
+    }
+
+    #[test]
+    fn remove_window_returns_empty() {
+        let info = WindowInfo::new(1);
+        let mut entry = AppEntry::new(AppId::from_window(&info), info, ResolvedPolicy::default());
+        entry.add_window(2);
+        assert!(!entry.remove_window(1)); // still has window 2
+        assert!(entry.remove_window(2)); // now empty
     }
 }

@@ -8,7 +8,10 @@ pub async fn is_using_camera(pids: &[u32]) -> bool {
     let pids = pids.to_vec();
     tokio::task::spawn_blocking(move || check_camera_sync(&pids))
         .await
-        .unwrap_or(false)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "camera check task failed");
+            false
+        })
 }
 
 fn check_camera_sync(pids: &[u32]) -> bool {

@@ -1,6 +1,13 @@
+//! Wayland focus tracking backends.
+//!
+//! Two backends are supported:
+//! - **wlr-foreign-toplevel** (Sway/Hyprland): uses native async Wayland event loop via `AsyncFd`
+//! - **GNOME Shell Introspect**: uses blocking `zbus` D-Bus API in `spawn_blocking` because
+//!   the `MessageIterator` API doesn't have an async equivalent suitable for our polling model.
+
+mod gnome;
 #[cfg(feature = "wayland")]
 mod wlr_toplevel;
-mod gnome;
 
 use tokio::sync::mpsc;
 
@@ -61,14 +68,6 @@ impl FocusBackend for WaylandBackend {
             #[cfg(feature = "wayland")]
             WaylandInner::Wlr(backend) => Box::new(backend).run(tx).await,
             WaylandInner::Gnome(backend) => Box::new(backend).run(tx).await,
-        }
-    }
-
-    fn is_fullscreen(&self, window_id: u64) -> bool {
-        match &self.inner {
-            #[cfg(feature = "wayland")]
-            WaylandInner::Wlr(backend) => backend.is_fullscreen(window_id),
-            WaylandInner::Gnome(backend) => backend.is_fullscreen(window_id),
         }
     }
 }

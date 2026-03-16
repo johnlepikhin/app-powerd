@@ -1,16 +1,23 @@
-pub mod process;
-pub mod cgroup;
-pub mod throttle;
-pub mod freeze;
+pub(crate) mod cgroup;
+pub(crate) mod freeze;
+/// Power source detection.
 pub mod power;
-pub mod systemd_dbus;
+pub(crate) mod process;
+pub(crate) mod systemd_dbus;
+pub(crate) mod throttle;
 
 use std::path::PathBuf;
 
 /// Sanitize a string to be a valid systemd unit name component.
 pub(crate) fn sanitize_unit_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -33,5 +40,33 @@ pub(crate) fn cgroup_base_path() -> PathBuf {
 
     // Fallback: systemd convention
     let uid = nix::unistd::getuid().as_raw();
-    PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"))
+    PathBuf::from(format!(
+        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_simple_name() {
+        assert_eq!(sanitize_unit_name("firefox"), "firefox");
+    }
+
+    #[test]
+    fn sanitize_dots_to_dashes() {
+        assert_eq!(
+            sanitize_unit_name("org.telegram.desktop"),
+            "org-telegram-desktop"
+        );
+    }
+
+    #[test]
+    fn sanitize_special_chars() {
+        let result = sanitize_unit_name("app/with spaces");
+        assert!(!result.contains('/'));
+        assert!(!result.contains(' '));
+        assert_eq!(result, "app-with-spaces");
+    }
 }

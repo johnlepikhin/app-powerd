@@ -1,4 +1,47 @@
-use tracing::debug;
+use std::time::Duration;
+
+use serde::Deserialize;
+use tracing::{debug, warn};
+
+/// Timeout for `pw-dump` subprocess.
+const PW_DUMP_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Deserialize)]
+struct PwNode {
+    #[serde(default)]
+    info: Option<PwNodeInfo>,
+}
+
+#[derive(Deserialize)]
+struct PwNodeInfo {
+    #[serde(default)]
+    props: PwProps,
+}
+
+#[derive(Deserialize, Default)]
+struct PwProps {
+    #[serde(rename = "media.class", default)]
+    media_class: Option<String>,
+    #[serde(rename = "application.process.id", default)]
+    app_pid: Option<PidValue>,
+}
+
+/// PipeWire emits `application.process.id` as either a string or a number.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PidValue {
+    Number(u64),
+    Text(String),
+}
+
+impl PidValue {
+    fn as_u32(&self) -> Option<u32> {
+        match self {
+            PidValue::Number(n) => u32::try_from(*n).ok(),
+            PidValue::Text(s) => s.parse().ok(),
+        }
+    }
+}
 
 /// Combined audio activity result from a single pw-dump call.
 #[derive(Default)]
@@ -10,46 +53,42 @@ pub struct AudioActivity {
 /// Check audio activity (playback and mic) for the given PIDs.
 /// Uses pw-dump (PipeWire) to detect active audio streams.
 pub async fn check_audio_activity(pids: &[u32]) -> AudioActivity {
-    let output = match tokio::process::Command::new("pw-dump").output().await {
-        Ok(o) => o,
-        Err(e) => {
-            debug!(error = %e, "pw-dump not available");
+    let output = match tokio::time::timeout(
+        PW_DUMP_TIMEOUT,
+        tokio::process::Command::new("pw-dump").output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            warn!(error = %e, "pw-dump not available");
+            return AudioActivity::default();
+        }
+        Err(_) => {
+            warn!("pw-dump timed out after 5s");
             return AudioActivity::default();
         }
     };
 
     if !output.status.success() {
-        return AudioActivity {
-            playing: false,
-            mic_active: false,
-        };
+        warn!(status = %output.status, "pw-dump exited with error");
+        return AudioActivity::default();
     }
 
-    let json: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+    let nodes: Vec<PwNode> = match serde_json::from_slice(&output.stdout) {
         Ok(v) => v,
-        Err(_) => {
-            return AudioActivity::default()
+        Err(e) => {
+            warn!(error = %e, "failed to parse pw-dump JSON output");
+            return AudioActivity::default();
         }
-    };
-
-    let Some(nodes) = json.as_array() else {
-        return AudioActivity {
-            playing: false,
-            mic_active: false,
-        };
     };
 
     let mut playing = false;
     let mut mic_active = false;
 
-    for node in nodes {
-        let Some(info) = node.get("info") else { continue };
-        let Some(props) = info.get("props") else { continue };
-
-        let class = props
-            .get("media.class")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+    for node in &nodes {
+        let Some(info) = &node.info else { continue };
+        let class = info.props.media_class.as_deref().unwrap_or("");
 
         let is_playback = class == "Stream/Output/Audio";
         let is_capture = class == "Stream/Input/Audio";
@@ -58,13 +97,7 @@ pub async fn check_audio_activity(pids: &[u32]) -> AudioActivity {
             continue;
         }
 
-        let stream_pid = props
-            .get("application.process.id")
-            .and_then(|v| {
-                v.as_str()
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .or_else(|| v.as_u64().map(|n| n as u32))
-            });
+        let stream_pid = info.props.app_pid.as_ref().and_then(PidValue::as_u32);
 
         if let Some(stream_pid) = stream_pid {
             if pids.contains(&stream_pid) {
@@ -83,5 +116,8 @@ pub async fn check_audio_activity(pids: &[u32]) -> AudioActivity {
         }
     }
 
-    AudioActivity { playing, mic_active }
+    AudioActivity {
+        playing,
+        mic_active,
+    }
 }

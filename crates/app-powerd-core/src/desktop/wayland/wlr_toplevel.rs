@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
-use std::sync::{Arc, Mutex};
 
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tracing::info;
 use wayland_client::protocol::{wl_registry, wl_registry::WlRegistry};
-use wayland_client::{Connection, Dispatch, QueueHandle, EventQueue, event_created_child};
+use wayland_client::{event_created_child, Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols_wlr::foreign_toplevel::v1::client::{
     zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
     zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
@@ -28,8 +27,7 @@ struct ToplevelState {
 /// Cached PID info to avoid repeated /proc scans.
 struct CachedPid {
     pid: u32,
-    exe: String,
-    cmdline: Option<String>,
+    info: crate::system::process::CachedProcessInfo,
 }
 
 /// Shared state between dispatch callbacks and the async loop.
@@ -80,7 +78,12 @@ impl Dispatch<WlRegistry, ()> for WlrState {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             if interface == "zwlr_foreign_toplevel_manager_v1" {
                 let manager = registry.bind::<ZwlrForeignToplevelManagerV1, _, _>(
                     name,
@@ -138,12 +141,10 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for WlrState {
                     .chunks_exact(4)
                     .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
-                pending.is_activated = states.contains(
-                    &(zwlr_foreign_toplevel_handle_v1::State::Activated as u32),
-                );
-                pending.is_fullscreen = states.contains(
-                    &(zwlr_foreign_toplevel_handle_v1::State::Fullscreen as u32),
-                );
+                pending.is_activated =
+                    states.contains(&(zwlr_foreign_toplevel_handle_v1::State::Activated as u32));
+                pending.is_fullscreen =
+                    states.contains(&(zwlr_foreign_toplevel_handle_v1::State::Fullscreen as u32));
             }
             zwlr_foreign_toplevel_handle_v1::Event::Done => {
                 if let Some(pending) = state.pending.remove(&id) {
@@ -153,7 +154,9 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for WlrState {
 
                     state.toplevels.insert(id, pending.clone());
 
-                    if pending.is_activated && (!was_activated || pending.is_fullscreen != was_fullscreen) {
+                    if pending.is_activated
+                        && (!was_activated || pending.is_fullscreen != was_fullscreen)
+                    {
                         // Focus changed or fullscreen state changed on active toplevel
                         let info = toplevel_to_window_info(id, &pending, &mut state.pid_cache);
                         state.pending_events.push(FocusEvent::FocusChanged(info));
@@ -167,7 +170,9 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for WlrState {
                     state.pid_cache.remove(&toplevel.app_id);
                 }
                 state.pending.remove(&id);
-                state.pending_events.push(FocusEvent::WindowClosed { window_id: id });
+                state
+                    .pending_events
+                    .push(FocusEvent::WindowClosed { window_id: id });
             }
             _ => {}
         }
@@ -189,22 +194,21 @@ fn toplevel_to_window_info(
     if !toplevel.app_id.is_empty() {
         if let Some(cached) = pid_cache.get(&toplevel.app_id) {
             info.pid = Some(cached.pid);
-            info.executable = Some(cached.exe.clone());
-            info.cmdline = cached.cmdline.clone();
+            info.executable = Some(cached.info.exe.clone());
+            info.cmdline = cached.info.cmdline.clone();
         } else if let Some(pid) = find_pid_by_app_id(&toplevel.app_id) {
-            let exe = crate::system::process::exe(pid).unwrap_or_default();
+            let exe = crate::system::process::exe_name(pid).unwrap_or_default();
             let cmdline = crate::system::process::cmdline(pid).ok();
+            info.pid = Some(pid);
+            info.executable = Some(exe.clone());
+            info.cmdline = cmdline.clone();
             pid_cache.insert(
                 toplevel.app_id.clone(),
                 CachedPid {
                     pid,
-                    exe: exe.clone(),
-                    cmdline: cmdline.clone(),
+                    info: crate::system::process::CachedProcessInfo { exe, cmdline },
                 },
             );
-            info.pid = Some(pid);
-            info.executable = Some(exe);
-            info.cmdline = cmdline;
         }
     }
 
@@ -217,10 +221,14 @@ fn find_pid_by_app_id(app_id: &str) -> Option<u32> {
     let proc_dir = std::fs::read_dir("/proc").ok()?;
 
     for entry in proc_dir.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
             continue;
         };
-        if let Ok(exe) = crate::system::process::exe(pid) {
+        if let Ok(exe) = crate::system::process::exe_name(pid) {
             if exe.to_lowercase() == app_id_lower {
                 return Some(pid);
             }
@@ -231,7 +239,6 @@ fn find_pid_by_app_id(app_id: &str) -> Option<u32> {
 
 pub struct WlrToplevelBackend {
     conn: Connection,
-    fullscreen_state: Arc<Mutex<HashMap<u64, bool>>>,
 }
 
 impl WlrToplevelBackend {
@@ -257,24 +264,13 @@ impl WlrToplevelBackend {
             ));
         }
 
-        Ok(Self {
-            conn,
-            fullscreen_state: Arc::new(Mutex::new(HashMap::new())),
-        })
-    }
-
-    pub fn is_fullscreen(&self, window_id: u64) -> bool {
-        self.fullscreen_state
-            .lock()
-            .map(|s| s.get(&window_id).copied().unwrap_or(false))
-            .unwrap_or(false)
+        Ok(Self { conn })
     }
 }
 
 #[async_trait::async_trait]
 impl FocusBackend for WlrToplevelBackend {
     async fn run(self: Box<Self>, tx: mpsc::Sender<FocusEvent>) -> Result<(), DesktopError> {
-        let fullscreen_state = self.fullscreen_state.clone();
         let conn = self.conn;
 
         let mut event_queue: EventQueue<WlrState> = conn.new_event_queue();
@@ -300,15 +296,9 @@ impl FocusBackend for WlrToplevelBackend {
             }
         }
 
-        // Update fullscreen state
-        for (id, toplevel) in &state.toplevels {
-            fullscreen_state
-                .lock()
-                .map(|mut s| s.insert(*id, toplevel.is_fullscreen))
-                .ok();
-        }
-
-        let fd = conn.prepare_read().map(|g| g.connection_fd().as_raw_fd())
+        let fd = conn
+            .prepare_read()
+            .map(|g| g.connection_fd().as_raw_fd())
             .ok_or_else(|| DesktopError::WaylandConnection("cannot get fd".into()))?;
         let async_fd = AsyncFd::new(fd)
             .map_err(|e| DesktopError::WaylandConnection(format!("AsyncFd: {e}")))?;
@@ -328,14 +318,6 @@ impl FocusBackend for WlrToplevelBackend {
                 .dispatch_pending(&mut state)
                 .map_err(|e| DesktopError::WaylandConnection(format!("dispatch: {e}")))?;
 
-            // Update fullscreen state
-            for (id, toplevel) in &state.toplevels {
-                fullscreen_state
-                    .lock()
-                    .map(|mut s| s.insert(*id, toplevel.is_fullscreen))
-                    .ok();
-            }
-
             // Send pending events
             for event in state.pending_events.drain(..) {
                 if tx.send(event).await.is_err() {
@@ -343,9 +325,5 @@ impl FocusBackend for WlrToplevelBackend {
                 }
             }
         }
-    }
-
-    fn is_fullscreen(&self, window_id: u64) -> bool {
-        self.is_fullscreen(window_id)
     }
 }

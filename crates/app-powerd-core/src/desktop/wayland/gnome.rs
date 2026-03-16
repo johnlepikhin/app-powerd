@@ -1,7 +1,12 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
+
+/// Timeout when waiting for the WindowsChanged D-Bus signal before falling back to a poll query.
+const SIGNAL_POLL_TIMEOUT: Duration = Duration::from_secs(2);
+/// Polling interval used when signal subscription is unavailable.
+const POLLING_INTERVAL: Duration = Duration::from_millis(250);
 use tracing::{debug, warn};
 use zbus::blocking::Connection;
 use zbus::zvariant::OwnedValue;
@@ -9,6 +14,9 @@ use zbus::zvariant::OwnedValue;
 use crate::desktop::window::WindowInfo;
 use crate::desktop::{FocusBackend, FocusEvent};
 use crate::error::DesktopError;
+
+const INTROSPECT_BUS: &str = "org.gnome.Shell.Introspect";
+const INTROSPECT_PATH: &str = "/org/gnome/Shell/Introspect";
 
 /// Window state from GNOME Shell Introspect.
 #[derive(Debug, Clone)]
@@ -21,9 +29,7 @@ struct WindowState {
 }
 
 /// GNOME Shell Introspect backend via D-Bus.
-pub struct GnomeIntrospectBackend {
-    fullscreen_state: Arc<Mutex<HashMap<u64, bool>>>,
-}
+pub struct GnomeIntrospectBackend;
 
 impl GnomeIntrospectBackend {
     pub fn new() -> Result<Self, DesktopError> {
@@ -32,9 +38,9 @@ impl GnomeIntrospectBackend {
             .map_err(|e| DesktopError::WaylandConnection(format!("D-Bus session: {e}")))?;
 
         conn.call_method(
-            Some("org.gnome.Shell.Introspect"),
-            "/org/gnome/Shell/Introspect",
-            Some("org.gnome.Shell.Introspect"),
+            Some(INTROSPECT_BUS),
+            INTROSPECT_PATH,
+            Some(INTROSPECT_BUS),
             "GetWindows",
             &(),
         )
@@ -42,28 +48,21 @@ impl GnomeIntrospectBackend {
             DesktopError::WaylandConnection(format!("GNOME Shell Introspect not available: {e}"))
         })?;
 
-        Ok(Self {
-            fullscreen_state: Arc::new(Mutex::new(HashMap::new())),
-        })
-    }
-
-    pub fn is_fullscreen(&self, window_id: u64) -> bool {
-        self.fullscreen_state
-            .lock()
-            .map(|s| s.get(&window_id).copied().unwrap_or(false))
-            .unwrap_or(false)
+        Ok(Self)
     }
 }
 
 #[async_trait::async_trait]
 impl FocusBackend for GnomeIntrospectBackend {
     async fn run(self: Box<Self>, tx: mpsc::Sender<FocusEvent>) -> Result<(), DesktopError> {
-        let fullscreen_state = self.fullscreen_state.clone();
-
         // Use blocking D-Bus in a spawn_blocking thread
         let (event_tx, mut event_rx) = mpsc::channel::<FocusEvent>(64);
+        let token = tokio_util::sync::CancellationToken::new();
+        let thread_token = token.clone();
 
+        let span = tracing::info_span!("gnome_introspect");
         tokio::task::spawn_blocking(move || {
+            let _guard = span.entered();
             let conn = match Connection::session() {
                 Ok(c) => c,
                 Err(e) => {
@@ -75,16 +74,12 @@ impl FocusBackend for GnomeIntrospectBackend {
             let mut last_focused: Option<u64> = None;
             let mut last_fullscreen: bool = false;
             let mut known_windows: HashMap<u64, WindowState> = HashMap::new();
-            let mut pid_cache: HashMap<u32, (String, Option<String>)> = HashMap::new();
+            let mut pid_cache: HashMap<u32, crate::system::process::CachedProcessInfo> =
+                HashMap::new();
 
             // Initial query
             if let Some(windows) = query_windows(&conn) {
                 for (id, state) in &windows {
-                    fullscreen_state
-                        .lock()
-                        .map(|mut s| s.insert(*id, state.is_fullscreen))
-                        .ok();
-
                     if state.is_focused {
                         let info = window_state_to_info(*id, state, &mut pid_cache);
                         last_focused = Some(*id);
@@ -106,11 +101,16 @@ impl FocusBackend for GnomeIntrospectBackend {
             }
 
             loop {
+                if thread_token.is_cancelled() {
+                    debug!("GNOME backend: cancellation requested, exiting");
+                    return;
+                }
+
                 if let Some(ref rx) = signal_rx {
-                    // Wait for signal with 2s timeout as fallback
-                    let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
+                    // Wait for signal with fallback timeout
+                    let _ = rx.recv_timeout(SIGNAL_POLL_TIMEOUT);
                 } else {
-                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    std::thread::sleep(POLLING_INTERVAL);
                 }
 
                 let Some(windows) = query_windows(&conn) else {
@@ -119,17 +119,17 @@ impl FocusBackend for GnomeIntrospectBackend {
 
                 // Detect focus changes
                 for (id, state) in &windows {
-                    fullscreen_state
-                        .lock()
-                        .map(|mut s| s.insert(*id, state.is_fullscreen))
-                        .ok();
-
-                    if state.is_focused && (last_focused != Some(*id) || state.is_fullscreen != last_fullscreen) {
+                    if state.is_focused
+                        && (last_focused != Some(*id) || state.is_fullscreen != last_fullscreen)
+                    {
                         let info = window_state_to_info(*id, state, &mut pid_cache);
                         debug!(window_id = id, app_id = %state.app_id, "GNOME focus changed");
                         last_focused = Some(*id);
                         last_fullscreen = state.is_fullscreen;
-                        if event_tx.blocking_send(FocusEvent::FocusChanged(info)).is_err() {
+                        if event_tx
+                            .blocking_send(FocusEvent::FocusChanged(info))
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -144,10 +144,6 @@ impl FocusBackend for GnomeIntrospectBackend {
 
                 for id in closed {
                     debug!(window_id = id, "GNOME window closed");
-                    fullscreen_state
-                        .lock()
-                        .map(|mut s| s.remove(&id))
-                        .ok();
                     if event_tx
                         .blocking_send(FocusEvent::WindowClosed { window_id: id })
                         .is_err()
@@ -167,18 +163,15 @@ impl FocusBackend for GnomeIntrospectBackend {
             }
         }
 
+        token.cancel();
         Ok(())
-    }
-
-    fn is_fullscreen(&self, window_id: u64) -> bool {
-        self.is_fullscreen(window_id)
     }
 }
 
 fn window_state_to_info(
     id: u64,
     state: &WindowState,
-    pid_cache: &mut HashMap<u32, (String, Option<String>)>,
+    pid_cache: &mut HashMap<u32, crate::system::process::CachedProcessInfo>,
 ) -> WindowInfo {
     let mut info = WindowInfo::new(id);
     info.title = Some(state.title.clone());
@@ -187,59 +180,55 @@ fn window_state_to_info(
     info.is_fullscreen = state.is_fullscreen;
     if state.pid > 0 {
         info.pid = Some(state.pid);
-        let (exe, cmdline) = pid_cache
-            .entry(state.pid)
-            .or_insert_with(|| {
-                let exe = crate::system::process::exe(state.pid).unwrap_or_default();
-                let cmdline = crate::system::process::cmdline(state.pid).ok();
-                (exe, cmdline)
-            });
-        info.executable = Some(exe.clone());
-        info.cmdline = cmdline.clone();
+        let cached = pid_cache.entry(state.pid).or_insert_with(|| {
+            let exe = crate::system::process::exe_name(state.pid).unwrap_or_default();
+            let cmdline = crate::system::process::cmdline(state.pid).ok();
+            crate::system::process::CachedProcessInfo { exe, cmdline }
+        });
+        info.executable = Some(cached.exe.clone());
+        info.cmdline = cached.cmdline.clone();
     }
     info
+}
+
+/// Extract a typed property from D-Bus window properties.
+fn get_prop<T: TryFrom<OwnedValue>>(props: &HashMap<String, OwnedValue>, key: &str) -> Option<T> {
+    props.get(key).and_then(|v| T::try_from(v.clone()).ok())
 }
 
 fn query_windows(conn: &Connection) -> Option<HashMap<u64, WindowState>> {
     let reply = conn
         .call_method(
-            Some("org.gnome.Shell.Introspect"),
-            "/org/gnome/Shell/Introspect",
-            Some("org.gnome.Shell.Introspect"),
+            Some(INTROSPECT_BUS),
+            INTROSPECT_PATH,
+            Some(INTROSPECT_BUS),
             "GetWindows",
             &(),
         )
+        .map_err(|e| {
+            debug!(error = %e, "GetWindows D-Bus call failed");
+            e
+        })
         .ok()?;
 
-    let body: HashMap<u64, HashMap<String, OwnedValue>> = reply.body().deserialize().ok()?;
+    let body: HashMap<u64, HashMap<String, OwnedValue>> = reply
+        .body()
+        .deserialize()
+        .map_err(|e| {
+            debug!(error = %e, "failed to deserialize GetWindows response");
+            e
+        })
+        .ok()?;
 
     let mut result = HashMap::new();
     for (id, props) in body {
-        let title = props
-            .get("title")
-            .and_then(|v| <String>::try_from(v.clone()).ok())
+        let title: String = get_prop(&props, "title").unwrap_or_default();
+        let app_id: String = get_prop(&props, "app-id")
+            .or_else(|| get_prop(&props, "wm-class"))
             .unwrap_or_default();
-
-        let app_id = props
-            .get("app-id")
-            .or_else(|| props.get("wm-class"))
-            .and_then(|v| <String>::try_from(v.clone()).ok())
-            .unwrap_or_default();
-
-        let pid = props
-            .get("pid")
-            .and_then(|v| <u32>::try_from(v.clone()).ok())
-            .unwrap_or(0);
-
-        let is_focused = props
-            .get("focus")
-            .and_then(|v| <bool>::try_from(v.clone()).ok())
-            .unwrap_or(false);
-
-        let is_fullscreen = props
-            .get("fullscreen")
-            .and_then(|v| <bool>::try_from(v.clone()).ok())
-            .unwrap_or(false);
+        let pid: u32 = get_prop(&props, "pid").unwrap_or(0);
+        let is_focused: bool = get_prop(&props, "focus").unwrap_or(false);
+        let is_fullscreen: bool = get_prop(&props, "fullscreen").unwrap_or(false);
 
         result.insert(
             id,
@@ -260,18 +249,18 @@ fn query_windows(conn: &Connection) -> Option<HashMap<u64, WindowState>> {
 /// A dedicated thread listens for signals and sends notifications.
 /// Returns None if subscription fails.
 fn subscribe_windows_changed(conn: &Connection) -> Option<std::sync::mpsc::Receiver<()>> {
-    use zbus::MatchRule;
     use zbus::message::Type;
+    use zbus::MatchRule;
 
     let rule = MatchRule::builder()
         .msg_type(Type::Signal)
-        .interface("org.gnome.Shell.Introspect").ok()?
-        .member("WindowsChanged").ok()?
+        .interface(INTROSPECT_BUS)
+        .ok()?
+        .member("WindowsChanged")
+        .ok()?
         .build();
 
-    let iter = zbus::blocking::MessageIterator::for_match_rule(
-        rule, conn, Some(64),
-    ).ok()?;
+    let iter = zbus::blocking::MessageIterator::for_match_rule(rule, conn, Some(64)).ok()?;
 
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
@@ -279,8 +268,9 @@ fn subscribe_windows_changed(conn: &Connection) -> Option<std::sync::mpsc::Recei
         .name("gnome-signal-watcher".into())
         .spawn(move || {
             for _msg in iter {
-                if tx.try_send(()).is_err() {
-                    // Receiver dropped or channel full — either way, nothing to do
+                match tx.try_send(()) {
+                    Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => {}
+                    Err(std::sync::mpsc::TrySendError::Disconnected(())) => break,
                 }
             }
         })

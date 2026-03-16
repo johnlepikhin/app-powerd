@@ -1,7 +1,10 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Application power state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum AppState {
     /// Window has focus or was recently focused.
     Active,
@@ -26,6 +29,7 @@ impl fmt::Display for AppState {
 
 /// Action to take on state transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransitionAction {
     /// Start the suspend_delay timer.
     StartSuspendTimer,
@@ -40,7 +44,7 @@ pub enum TransitionAction {
     /// Thaw the application.
     Thaw,
     /// No action needed.
-    None,
+    NoOp,
 }
 
 impl TransitionAction {
@@ -61,7 +65,7 @@ impl AppState {
         match self {
             AppState::Active => (AppState::Background, TransitionAction::StartSuspendTimer),
             // Already in background/throttled/frozen — no change
-            other => (other, TransitionAction::None),
+            other => (other, TransitionAction::NoOp),
         }
     }
 
@@ -71,19 +75,30 @@ impl AppState {
             AppState::Background => (AppState::Active, TransitionAction::CancelSuspendTimer),
             AppState::Throttled => (AppState::Active, TransitionAction::RemoveThrottle),
             AppState::Frozen => (AppState::Active, TransitionAction::Thaw),
-            AppState::Active => (AppState::Active, TransitionAction::None),
+            AppState::Active => (AppState::Active, TransitionAction::NoOp),
         }
     }
 
     /// Compute transition when suspend_delay timer fires.
-    pub fn on_suspend_timer(self, freeze: bool) -> (AppState, TransitionAction) {
+    pub fn on_suspend_timer(self, mode: SuspendMode) -> (AppState, TransitionAction) {
         match self {
-            AppState::Background if freeze => (AppState::Frozen, TransitionAction::ApplyFreeze),
-            AppState::Background => (AppState::Throttled, TransitionAction::ApplyThrottle),
+            AppState::Background => match mode {
+                SuspendMode::Freeze => (AppState::Frozen, TransitionAction::ApplyFreeze),
+                SuspendMode::Throttle => (AppState::Throttled, TransitionAction::ApplyThrottle),
+            },
             // Timer fired but state already changed — ignore
-            other => (other, TransitionAction::None),
+            other => (other, TransitionAction::NoOp),
         }
     }
+}
+
+/// Mode for suspending a background application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendMode {
+    /// Freeze via cgroup freezer or SIGSTOP.
+    Freeze,
+    /// Throttle CPU via cgroup/nice.
+    Throttle,
 }
 
 #[cfg(test)]
@@ -113,14 +128,14 @@ mod tests {
 
     #[test]
     fn background_to_frozen_on_timer() {
-        let (state, action) = AppState::Background.on_suspend_timer(true);
+        let (state, action) = AppState::Background.on_suspend_timer(SuspendMode::Freeze);
         assert_eq!(state, AppState::Frozen);
         assert_eq!(action, TransitionAction::ApplyFreeze);
     }
 
     #[test]
     fn background_to_throttled_on_timer() {
-        let (state, action) = AppState::Background.on_suspend_timer(false);
+        let (state, action) = AppState::Background.on_suspend_timer(SuspendMode::Throttle);
         assert_eq!(state, AppState::Throttled);
         assert_eq!(action, TransitionAction::ApplyThrottle);
     }
@@ -129,6 +144,20 @@ mod tests {
     fn already_frozen_ignores_focus_lost() {
         let (state, action) = AppState::Frozen.on_focus_lost();
         assert_eq!(state, AppState::Frozen);
-        assert_eq!(action, TransitionAction::None);
+        assert_eq!(action, TransitionAction::NoOp);
+    }
+
+    #[test]
+    fn active_ignores_suspend_timer() {
+        let (state, action) = AppState::Active.on_suspend_timer(SuspendMode::Freeze);
+        assert_eq!(state, AppState::Active);
+        assert_eq!(action, TransitionAction::NoOp);
+    }
+
+    #[test]
+    fn frozen_ignores_suspend_timer() {
+        let (state, action) = AppState::Frozen.on_suspend_timer(SuspendMode::Throttle);
+        assert_eq!(state, AppState::Frozen);
+        assert_eq!(action, TransitionAction::NoOp);
     }
 }

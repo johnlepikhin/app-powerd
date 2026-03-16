@@ -12,12 +12,10 @@ pub fn get_idle_time() -> Option<Duration> {
 
     static X11_CONN: OnceLock<Option<(RustConnection, usize)>> = OnceLock::new();
 
-    let conn_opt = X11_CONN.get_or_init(|| {
-        RustConnection::connect(None).ok()
-    });
+    let conn_opt = X11_CONN.get_or_init(|| RustConnection::connect(None).ok());
 
     let (conn, screen_num) = conn_opt.as_ref()?;
-    let root = conn.setup().roots[*screen_num].root;
+    let root = conn.setup().roots.get(*screen_num)?.root;
     let reply = screensaver::query_info(conn, root).ok()?.reply().ok()?;
     Some(Duration::from_millis(reply.ms_since_user_input as u64))
 }

@@ -1,12 +1,21 @@
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 
 use crate::error::SystemError;
 
 /// Read /proc/PID/exe symlink to get executable path.
-pub fn exe(pid: u32) -> Result<String, SystemError> {
-    let link = fs::read_link(format!("/proc/{pid}/exe"))
-        .map_err(|_| SystemError::ProcessNotFound { pid })?;
+pub(crate) fn exe_name(pid: u32) -> Result<String, SystemError> {
+    let link = fs::read_link(format!("/proc/{pid}/exe")).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            SystemError::ProcessNotFound { pid }
+        } else {
+            SystemError::ProcessReadError {
+                pid,
+                message: format!("failed to read exe: {e}"),
+            }
+        }
+    })?;
     // Extract just the filename
     Ok(link
         .file_name()
@@ -15,9 +24,17 @@ pub fn exe(pid: u32) -> Result<String, SystemError> {
 }
 
 /// Read /proc/PID/cmdline.
-pub fn cmdline(pid: u32) -> Result<String, SystemError> {
-    let data = fs::read(format!("/proc/{pid}/cmdline"))
-        .map_err(|_| SystemError::ProcessNotFound { pid })?;
+pub(crate) fn cmdline(pid: u32) -> Result<String, SystemError> {
+    let data = fs::read(format!("/proc/{pid}/cmdline")).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            SystemError::ProcessNotFound { pid }
+        } else {
+            SystemError::ProcessReadError {
+                pid,
+                message: format!("failed to read cmdline: {e}"),
+            }
+        }
+    })?;
     // cmdline is null-separated
     Ok(data
         .split(|&b| b == 0)
@@ -28,26 +45,11 @@ pub fn cmdline(pid: u32) -> Result<String, SystemError> {
         .to_string())
 }
 
-/// Read /proc/PID/cgroup to get current cgroup path.
-pub fn cgroup_path(pid: u32) -> Result<String, SystemError> {
-    let content = fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .map_err(|_| SystemError::ProcessNotFound { pid })?;
-    // cgroup v2 format: "0::/path"
-    for line in content.lines() {
-        if let Some(path) = line.strip_prefix("0::") {
-            return Ok(path.to_string());
-        }
-    }
-    Err(SystemError::CgroupError {
-        message: format!("no cgroup v2 entry for pid {pid}"),
-    })
-}
-
 /// Collect all descendant PIDs of the given PID (recursive).
 ///
 /// Walks `/proc/<pid>/task/<tid>/children` to find all transitive children.
 /// Returns an empty vec if the process has no children or on any error.
-pub fn descendant_pids(pid: u32) -> Vec<u32> {
+pub(crate) fn descendant_pids(pid: u32) -> Vec<u32> {
     let mut result = Vec::new();
     let mut stack = vec![pid];
     while let Some(current) = stack.pop() {
@@ -71,13 +73,25 @@ pub fn descendant_pids(pid: u32) -> Vec<u32> {
     result
 }
 
+/// Cached process info to avoid repeated /proc reads.
+pub(crate) struct CachedProcessInfo {
+    /// Executable basename.
+    pub exe: String,
+    /// Command line, if available.
+    pub cmdline: Option<String>,
+}
+
 /// Build a map of executable name → desktop file ID from .desktop files.
 /// Scans /usr/share/applications/ and $XDG_DATA_HOME/applications/.
-pub fn build_desktop_index() -> std::collections::HashMap<String, String> {
+pub(crate) fn build_desktop_index() -> std::collections::HashMap<String, String> {
     use tracing::debug;
 
     let mut index = std::collections::HashMap::new();
-    let mut dirs = vec![PathBuf::from("/usr/share/applications")];
+    let mut dirs: Vec<PathBuf> = std::env::var("XDG_DATA_DIRS")
+        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string())
+        .split(':')
+        .map(|d| PathBuf::from(d).join("applications"))
+        .collect();
 
     if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
         dirs.push(PathBuf::from(data_home).join("applications"));
@@ -86,7 +100,9 @@ pub fn build_desktop_index() -> std::collections::HashMap<String, String> {
     }
 
     for dir in &dirs {
-        let Ok(entries) = fs::read_dir(dir) else { continue };
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
@@ -111,8 +127,16 @@ pub fn build_desktop_index() -> std::collections::HashMap<String, String> {
 
 /// Extract the executable name from the Exec= line of a .desktop file.
 fn parse_exec_from_desktop(content: &str) -> Option<String> {
+    let mut in_desktop_entry = false;
     for line in content.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_desktop_entry = trimmed == "[Desktop Entry]";
+            continue;
+        }
+        if !in_desktop_entry {
+            continue;
+        }
         if let Some(exec_val) = trimmed.strip_prefix("Exec=") {
             // Take the first token, strip any leading path
             let cmd = exec_val.split_whitespace().next()?;
@@ -127,10 +151,7 @@ fn parse_exec_from_desktop(content: &str) -> Option<String> {
                 cmd
             };
             // Extract just the filename from path
-            let name = std::path::Path::new(cmd)
-                .file_name()?
-                .to_str()?
-                .to_string();
+            let name = std::path::Path::new(cmd).file_name()?.to_str()?.to_string();
             return Some(name);
         }
     }
@@ -142,9 +163,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_self_exe() {
+    fn read_self_exe_name() {
         let pid = std::process::id();
-        let name = exe(pid).unwrap();
+        let name = exe_name(pid).unwrap();
         assert!(!name.is_empty());
     }
 
@@ -156,9 +177,46 @@ mod tests {
     }
 
     #[test]
-    fn read_self_cgroup() {
-        let pid = std::process::id();
-        // May fail in some environments but shouldn't panic
-        let _ = cgroup_path(pid);
+    fn parse_exec_simple_path() {
+        assert_eq!(
+            super::parse_exec_from_desktop("[Desktop Entry]\nExec=/usr/bin/firefox %u\n"),
+            Some("firefox".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_exec_with_env_prefix() {
+        assert_eq!(
+            super::parse_exec_from_desktop(
+                "[Desktop Entry]\nExec=env GDK_BACKEND=wayland telegram-desktop\n"
+            ),
+            Some("telegram-desktop".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_exec_with_multiple_env_vars() {
+        assert_eq!(
+            super::parse_exec_from_desktop(
+                "[Desktop Entry]\nExec=env VAR1=a VAR2=b /opt/app/myapp --flag\n"
+            ),
+            Some("myapp".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_exec_bare_command() {
+        assert_eq!(
+            super::parse_exec_from_desktop("[Desktop Entry]\nExec=code --unity-launch %F\n"),
+            Some("code".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_exec_no_exec_line() {
+        assert_eq!(
+            super::parse_exec_from_desktop("[Desktop Entry]\nName=Test\n"),
+            None
+        );
     }
 }

@@ -4,8 +4,11 @@ use std::time::Duration;
 
 use tracing::info;
 
+use serde::{Deserialize, Serialize};
+
 /// Power source status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum PowerSource {
     Battery,
     Ac,
@@ -58,13 +61,17 @@ pub fn watch_power_source(
     tx: tokio::sync::mpsc::Sender<PowerSource>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut last = detect_power_source();
+        let mut last = tokio::task::spawn_blocking(detect_power_source)
+            .await
+            .unwrap_or(PowerSource::Unknown);
         info!(?last, "initial power source");
         let _ = tx.send(last).await;
 
         loop {
             tokio::time::sleep(interval).await;
-            let current = detect_power_source();
+            let current = tokio::task::spawn_blocking(detect_power_source)
+                .await
+                .unwrap_or(PowerSource::Unknown);
             if current != last {
                 info!(from = ?last, to = ?current, "power source changed");
                 last = current;

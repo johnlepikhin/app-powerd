@@ -8,8 +8,8 @@ use x11rb::protocol::xproto::*;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
-use super::{FocusBackend, FocusEvent};
 use super::window::WindowInfo;
+use super::{FocusBackend, FocusEvent};
 use crate::error::DesktopError;
 use crate::system::process;
 
@@ -30,7 +30,9 @@ impl X11Backend {
         let (conn, screen_num) = RustConnection::connect(None)
             .map_err(|e| DesktopError::X11Connection(e.to_string()))?;
 
-        let screen = &conn.setup().roots[screen_num];
+        let screen = conn.setup().roots.get(screen_num).ok_or_else(|| {
+            DesktopError::X11Connection(format!("invalid screen number: {screen_num}"))
+        })?;
         let root = screen.root;
 
         change_window_attributes(
@@ -39,7 +41,8 @@ impl X11Backend {
             &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
         )
         .map_err(|e| DesktopError::X11Connection(e.to_string()))?;
-        conn.flush().map_err(|e| DesktopError::X11Connection(e.to_string()))?;
+        conn.flush()
+            .map_err(|e| DesktopError::X11Connection(e.to_string()))?;
 
         let intern = |name: &[u8]| -> Result<u32, DesktopError> {
             intern_atom(&conn, false, name)
@@ -76,12 +79,8 @@ impl X11Backend {
     }
 
     fn get_active_window(&self) -> Option<u32> {
-        let reply = self.get_property_reply(
-            self.root,
-            self.active_window_atom,
-            AtomEnum::WINDOW,
-            1,
-        )?;
+        let reply =
+            self.get_property_reply(self.root, self.active_window_atom, AtomEnum::WINDOW, 1)?;
 
         if reply.value_len == 0 {
             return None;
@@ -98,23 +97,23 @@ impl X11Backend {
         let mut info = WindowInfo::new(window_id as u64);
 
         // PID
-        if let Some(reply) = self.get_property_reply(
-            window_id, self.net_wm_pid_atom, AtomEnum::CARDINAL, 1,
-        ) {
+        if let Some(reply) =
+            self.get_property_reply(window_id, self.net_wm_pid_atom, AtomEnum::CARDINAL, 1)
+        {
             if reply.value_len > 0 {
                 let pid = u32::from_ne_bytes(reply.value[..4].try_into().unwrap_or([0; 4]));
                 if pid > 0 {
                     info.pid = Some(pid);
-                    info.executable = process::exe(pid).ok();
+                    info.executable = process::exe_name(pid).ok();
                     info.cmdline = process::cmdline(pid).ok();
                 }
             }
         }
 
         // WM_CLASS
-        if let Some(reply) = self.get_property_reply(
-            window_id, self.wm_class_atom, AtomEnum::STRING, 256,
-        ) {
+        if let Some(reply) =
+            self.get_property_reply(window_id, self.wm_class_atom, AtomEnum::STRING, 256)
+        {
             if !reply.value.is_empty() {
                 let parts: Vec<&[u8]> = reply.value.split(|&b| b == 0).collect();
                 if parts.len() >= 2 {
@@ -125,7 +124,10 @@ impl X11Backend {
 
         // _NET_WM_NAME (title)
         if let Some(reply) = self.get_property_reply(
-            window_id, self.net_wm_name_atom, self.utf8_string_atom, 1024,
+            window_id,
+            self.net_wm_name_atom,
+            self.utf8_string_atom,
+            1024,
         ) {
             if !reply.value.is_empty() {
                 info.title = Some(String::from_utf8_lossy(&reply.value).to_string());
@@ -137,9 +139,9 @@ impl X11Backend {
     }
 
     fn check_fullscreen(&self, window_id: u32) -> bool {
-        let Some(reply) = self.get_property_reply(
-            window_id, self.net_wm_state_atom, AtomEnum::ATOM, 32,
-        ) else {
+        let Some(reply) =
+            self.get_property_reply(window_id, self.net_wm_state_atom, AtomEnum::ATOM, 32)
+        else {
             return false;
         };
 
@@ -169,11 +171,15 @@ impl FocusBackend for X11Backend {
         }
 
         loop {
-            let mut guard = fd.readable().await
+            let mut guard = fd
+                .readable()
+                .await
                 .map_err(|e| DesktopError::X11Connection(e.to_string()))?;
             guard.clear_ready();
 
-            while let Some(event) = self.conn.poll_for_event()
+            while let Some(event) = self
+                .conn
+                .poll_for_event()
                 .map_err(|e| DesktopError::X11Connection(e.to_string()))?
             {
                 match event {
@@ -197,9 +203,13 @@ impl FocusBackend for X11Backend {
                     }
                     Event::DestroyNotify(ev) => {
                         debug!(window_id = ev.window, "window destroyed");
-                        if tx.send(FocusEvent::WindowClosed {
-                            window_id: ev.window as u64,
-                        }).await.is_err() {
+                        if tx
+                            .send(FocusEvent::WindowClosed {
+                                window_id: ev.window as u64,
+                            })
+                            .await
+                            .is_err()
+                        {
                             return Ok(());
                         }
                     }
@@ -207,9 +217,5 @@ impl FocusBackend for X11Backend {
                 }
             }
         }
-    }
-
-    fn is_fullscreen(&self, window_id: u64) -> bool {
-        self.check_fullscreen(window_id as u32)
     }
 }

@@ -1,6 +1,6 @@
-pub mod audio;
-pub mod camera;
-pub mod input;
+pub(crate) mod audio;
+pub(crate) mod camera;
+pub(crate) mod input;
 
 use crate::config::{GuardAction, GuardsConfig};
 
@@ -40,7 +40,6 @@ pub async fn check_guards(
     pids: &[u32],
     guards_config: &GuardsConfig,
     is_fullscreen: bool,
-    idle_threshold: Option<std::time::Duration>,
 ) -> GuardResult {
     // Audio + mic guard (single pw-dump call)
     if guards_config.audio_active == GuardAction::Check
@@ -57,9 +56,7 @@ pub async fn check_guards(
     }
 
     // Camera guard
-    if guards_config.camera_active == GuardAction::Check
-        && camera::is_using_camera(pids).await
-    {
+    if guards_config.camera_active == GuardAction::Check && camera::is_using_camera(pids).await {
         return GuardResult::Block(GuardBlockReason::CameraActive);
     }
 
@@ -69,7 +66,7 @@ pub async fn check_guards(
     }
 
     // Recent input guard
-    if let Some(threshold) = idle_threshold.or(guards_config.input_idle) {
+    if let Some(threshold) = guards_config.input_idle {
         if input::has_recent_input(threshold) {
             return GuardResult::Block(GuardBlockReason::RecentInput);
         }

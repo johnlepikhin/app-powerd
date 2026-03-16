@@ -8,54 +8,82 @@ use super::cgroup::CgroupManager;
 use crate::error::SystemError;
 
 /// Freeze an application's processes.
-pub fn freeze_app(
+pub(crate) fn freeze_app(
     cgroup_mgr: &CgroupManager,
     cgroup_path: Option<&Path>,
     pids: &[u32],
 ) -> Result<(), SystemError> {
     // Try cgroup freeze first
     if let Some(path) = cgroup_path {
-        if cgroup_mgr.freeze(path).is_ok() {
-            return Ok(());
+        match cgroup_mgr.freeze(path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                warn!(cgroup = %path.display(), error = %e, "cgroup freeze failed, falling back to SIGSTOP")
+            }
         }
-        warn!("cgroup freeze failed, falling back to SIGSTOP");
     }
 
     // Fallback: SIGSTOP all PIDs including descendants
     let all_pids = collect_all_pids(pids);
+    let mut successes = 0u32;
+    let mut last_error = None;
     for &pid in &all_pids {
-        if let Err(e) = signal_stop(pid) {
-            warn!(pid, error = %e, "SIGSTOP failed");
+        match signal_stop(pid) {
+            Ok(()) => successes += 1,
+            Err(e) => {
+                warn!(pid, error = %e, "SIGSTOP failed");
+                last_error = Some(e);
+            }
+        }
+    }
+    if successes == 0 {
+        if let Some(e) = last_error {
+            return Err(e);
         }
     }
     Ok(())
 }
 
 /// Thaw (unfreeze) an application's processes.
-pub fn thaw_app(
+pub(crate) fn thaw_app(
     cgroup_mgr: &CgroupManager,
     cgroup_path: Option<&Path>,
     pids: &[u32],
 ) -> Result<(), SystemError> {
     if let Some(path) = cgroup_path {
-        if cgroup_mgr.thaw(path).is_ok() {
-            return Ok(());
+        match cgroup_mgr.thaw(path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                warn!(cgroup = %path.display(), error = %e, "cgroup thaw failed, falling back to SIGCONT")
+            }
         }
-        warn!("cgroup thaw failed, falling back to SIGCONT");
     }
 
     // Fallback: SIGCONT all PIDs including descendants
     let all_pids = collect_all_pids(pids);
+    let mut successes = 0u32;
+    let mut last_error = None;
     for &pid in &all_pids {
-        if let Err(e) = signal_cont(pid) {
-            warn!(pid, error = %e, "SIGCONT failed");
+        match signal_cont(pid) {
+            Ok(()) => successes += 1,
+            Err(e) => {
+                warn!(pid, error = %e, "SIGCONT failed");
+                last_error = Some(e);
+            }
+        }
+    }
+    if successes == 0 {
+        if let Some(e) = last_error {
+            return Err(e);
         }
     }
     Ok(())
 }
 
 fn pid_to_nix(pid: u32) -> Result<Pid, SystemError> {
-    let raw: i32 = pid.try_into().map_err(|_| SystemError::ProcessNotFound { pid })?;
+    let raw: i32 = pid
+        .try_into()
+        .map_err(|_| SystemError::ProcessNotFound { pid })?;
     if raw <= 0 {
         return Err(SystemError::ProcessNotFound { pid });
     }
