@@ -208,8 +208,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_wrong_version() {
-        let mut config = Config::default();
-        config.version = 2;
+        let config = Config {
+            version: 2,
+            ..Config::default()
+        };
         assert!(validate(&config).is_err());
     }
 
