@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -11,7 +11,7 @@ use app_powerd_core::desktop;
 use app_powerd_core::engine::{Engine, EngineEvent};
 use app_powerd_core::ipc::protocol::{self, socket_path, IpcRequest, IpcResponse};
 use app_powerd_core::ipc::{send_request, IpcServer};
-use app_powerd_core::system::power;
+use app_powerd_core::system::power::{self, PowerSource};
 
 #[derive(Parser)]
 #[command(
@@ -50,8 +50,32 @@ enum Commands {
     },
     /// Reload configuration.
     ReloadConfig,
+    /// Force the daemon to treat the system as if running on a specific power source.
+    /// Use `auto` to clear the override and return to the detected source.
+    /// The override is in-memory only and is reset to `auto` on daemon restart.
+    Force {
+        /// Forced mode: battery, ac, or auto.
+        mode: ForcedMode,
+    },
     /// Shutdown the daemon.
     Shutdown,
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum ForcedMode {
+    Battery,
+    Ac,
+    Auto,
+}
+
+impl From<ForcedMode> for Option<PowerSource> {
+    fn from(mode: ForcedMode) -> Self {
+        match mode {
+            ForcedMode::Battery => Some(PowerSource::Battery),
+            ForcedMode::Ac => Some(PowerSource::Ac),
+            ForcedMode::Auto => None,
+        }
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -219,6 +243,9 @@ async fn run_client(command: Commands) -> Result<()> {
         Commands::Freeze { pid } => IpcRequest::Freeze { pid },
         Commands::Thaw { pid } => IpcRequest::Thaw { pid },
         Commands::ReloadConfig => IpcRequest::ReloadConfig,
+        Commands::Force { mode } => IpcRequest::SetPowerOverride {
+            source: mode.into(),
+        },
         Commands::Shutdown => IpcRequest::Shutdown,
         Commands::Run { .. } => unreachable!(),
     };
@@ -262,12 +289,18 @@ async fn run_client(command: Commands) -> Result<()> {
         IpcResponse::Status {
             enabled,
             power_source,
+            forced_power_source,
             tracked_apps,
             uptime_secs,
         } => {
             println!("app-powerd status:");
             println!("  enabled:      {enabled}");
-            println!("  power source: {power_source:?}");
+            match forced_power_source {
+                Some(forced) => println!(
+                    "  power source: {forced} (forced; detected: {power_source})"
+                ),
+                None => println!("  power source: {power_source} (auto)"),
+            }
             println!("  tracked apps: {tracked_apps}");
             println!("  uptime:       {uptime_secs}s");
         }

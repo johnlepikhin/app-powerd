@@ -12,15 +12,20 @@ impl Engine {
 
                 self.rematch_tracked_apps();
 
-                if !self.should_manage() {
-                    self.thaw_all();
-                } else if !was_managing {
-                    self.start_management();
-                }
+                self.reconcile_management(was_managing);
             }
             Err(e) => {
                 error!(error = %e, "config reload failed");
             }
+        }
+    }
+
+    /// Apply thaw/start transitions when management eligibility flipped.
+    fn reconcile_management(&mut self, was_managing: bool) {
+        if !self.should_manage() {
+            self.thaw_all();
+        } else if !was_managing {
+            self.start_management();
         }
     }
 
@@ -98,15 +103,36 @@ impl Engine {
     }
 
     pub(crate) fn handle_power_change(&mut self, source: PowerSource) {
+        if self.power_source == source {
+            return;
+        }
         let was_managing = self.should_manage();
         info!(?source, "power source changed");
         self.power_source = source;
+        self.reconcile_management(was_managing);
+    }
 
-        if !self.should_manage() {
-            self.thaw_all();
-        } else if !was_managing {
-            self.start_management();
+    /// Apply or clear the in-memory power-source override. May trigger
+    /// `thaw_all` or `start_management` if effective management eligibility
+    /// flips.
+    pub(crate) fn handle_set_power_override(&mut self, source: Option<PowerSource>) {
+        if self.forced_power_source == source {
+            return;
         }
+        let was_managing = self.should_manage();
+        info!(
+            previous = ?self.forced_power_source,
+            new = ?source,
+            effective = %source.unwrap_or(self.power_source),
+            "power source override updated",
+        );
+        self.forced_power_source = source;
+        self.reconcile_management(was_managing);
+    }
+
+    /// The power source the engine acts on: forced override if set, otherwise detected source.
+    fn effective_power_source(&self) -> PowerSource {
+        self.forced_power_source.unwrap_or(self.power_source)
     }
 
     pub(crate) fn should_manage(&self) -> bool {
@@ -115,7 +141,7 @@ impl Engine {
         }
 
         let config = self.rules_engine.config();
-        match self.power_source {
+        match self.effective_power_source() {
             PowerSource::Ac => config.defaults.mode.ac == PowerMode::Enable,
             PowerSource::Battery => config.defaults.mode.battery == PowerMode::Enable,
             PowerSource::Unknown => true,

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::metrics::MetricsSnapshot;
+use crate::system::power::PowerSource;
 
 /// IPC request from CLI to daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,13 +20,23 @@ pub enum IpcRequest {
     Thaw { pid: u32 },
     /// Reload configuration.
     ReloadConfig,
+    /// Override the detected power source. `None` clears the override (auto mode).
+    ///
+    /// The override is in-memory only and is reset on daemon restart.
+    /// `Ok` means the command was accepted and the override is set; the actual
+    /// thaw/start side-effects on tracked apps may partially fail and are only
+    /// reported in the daemon log (search for `power source override updated`).
+    SetPowerOverride { source: Option<PowerSource> },
     /// Shutdown the daemon.
     Shutdown,
 }
 
 /// IPC response from daemon to CLI.
+///
+/// Note: variants and fields are intentionally not `deny_unknown_fields` so
+/// that newer daemons can add response fields without breaking older clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", deny_unknown_fields)]
+#[serde(tag = "type")]
 #[non_exhaustive]
 pub enum IpcResponse {
     Ok {
@@ -39,7 +50,9 @@ pub enum IpcResponse {
     },
     Status {
         enabled: bool,
-        power_source: crate::system::power::PowerSource,
+        power_source: PowerSource,
+        #[serde(default)]
+        forced_power_source: Option<PowerSource>,
         tracked_apps: usize,
         uptime_secs: u64,
     },

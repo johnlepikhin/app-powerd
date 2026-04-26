@@ -79,6 +79,7 @@ pub struct Engine {
     exe_to_desktop: std::collections::HashMap<String, String>,
     enabled: bool,
     power_source: PowerSource,
+    forced_power_source: Option<PowerSource>,
     start_time: Instant,
 }
 
@@ -107,6 +108,7 @@ impl Engine {
             exe_to_desktop,
             enabled,
             power_source: PowerSource::Unknown,
+            forced_power_source: None,
             start_time: Instant::now(),
         };
 

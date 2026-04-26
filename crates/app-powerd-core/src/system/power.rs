@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -13,6 +14,17 @@ pub enum PowerSource {
     Battery,
     Ac,
     Unknown,
+}
+
+impl fmt::Display for PowerSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            PowerSource::Battery => "battery",
+            PowerSource::Ac => "ac",
+            PowerSource::Unknown => "unknown",
+        };
+        f.write_str(s)
+    }
 }
 
 /// Detect current power source from sysfs.

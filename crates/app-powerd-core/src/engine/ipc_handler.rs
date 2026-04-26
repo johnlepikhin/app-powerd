@@ -1,7 +1,7 @@
 use super::*;
 
 impl Engine {
-    pub(crate) fn handle_ipc(&self, request: IpcRequest) -> IpcResponse {
+    pub(crate) fn handle_ipc(&mut self, request: IpcRequest) -> IpcResponse {
         match request {
             IpcRequest::List => {
                 let apps = self
@@ -21,9 +21,23 @@ impl Engine {
             IpcRequest::Status => IpcResponse::Status {
                 enabled: self.enabled && self.should_manage(),
                 power_source: self.power_source,
+                forced_power_source: self.forced_power_source,
                 tracked_apps: self.registry.len(),
                 uptime_secs: self.start_time.elapsed().as_secs(),
             },
+            IpcRequest::SetPowerOverride { source } => {
+                if matches!(source, Some(PowerSource::Unknown)) {
+                    return IpcResponse::Error {
+                        message: "cannot force power source to 'unknown'".into(),
+                    };
+                }
+                self.handle_set_power_override(source);
+                // User-facing label; CLI/scripts may parse this — keep stable.
+                let label = source.map_or("auto".to_string(), |s| s.to_string());
+                IpcResponse::Ok {
+                    message: format!("power source override set to {label}"),
+                }
+            }
             IpcRequest::Stats => IpcResponse::Stats {
                 metrics: METRICS.snapshot(),
             },

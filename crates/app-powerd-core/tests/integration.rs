@@ -418,6 +418,148 @@ defaults:
     engine_handle.await.unwrap();
 }
 
+/// Test: SetPowerOverride forces effective power source and clearing returns to detected.
+#[tokio::test]
+async fn power_source_override_flow() {
+    // Config: ac=disable, battery=enable
+    let config: Config = serde_yaml_ng::from_str(
+        r#"
+version: 1
+defaults:
+  enabled: true
+  mode:
+    ac: disable
+    battery: enable
+  timing:
+    suspend_delay: "100ms"
+    resume_grace: "50ms"
+    min_suspend: "10ms"
+"#,
+    )
+    .unwrap();
+    let config_path = std::path::PathBuf::from("/tmp/test-config.yaml");
+    let (engine, tx) = Engine::new(config, config_path).expect("engine init");
+    let engine_handle = tokio::spawn(engine.run());
+
+    // Detected source = AC → management disabled. Round-tripping Status
+    // here also serves as a synchronization barrier ensuring the prior
+    // PowerSourceChanged event has been processed (single-threaded engine).
+    tx.send(EngineEvent::PowerSourceChanged(PowerSource::Ac))
+        .await
+        .unwrap();
+    let status = query_status(&tx).await;
+    assert!(!status.enabled, "should be disabled on AC");
+    assert_eq!(status.power_source, PowerSource::Ac);
+    assert_eq!(status.forced_power_source, None);
+
+    // Force battery → management enabled, override visible
+    let resp = send_set_override(&tx, Some(PowerSource::Battery)).await;
+    assert!(matches!(resp, IpcResponse::Ok { .. }));
+
+    let status = query_status(&tx).await;
+    assert!(status.enabled, "should be enabled when forced to battery");
+    assert_eq!(status.power_source, PowerSource::Ac, "detected unchanged");
+    assert_eq!(status.forced_power_source, Some(PowerSource::Battery));
+
+    // Detection change while forced: no effect on management
+    tx.send(EngineEvent::PowerSourceChanged(PowerSource::Battery))
+        .await
+        .unwrap();
+    let status = query_status(&tx).await;
+    assert!(status.enabled);
+    assert_eq!(status.power_source, PowerSource::Battery);
+    assert_eq!(status.forced_power_source, Some(PowerSource::Battery));
+
+    // Detected flips back to AC; still forced to battery → still managing
+    tx.send(EngineEvent::PowerSourceChanged(PowerSource::Ac))
+        .await
+        .unwrap();
+    let status = query_status(&tx).await;
+    assert!(status.enabled, "still managing while forced");
+
+    // Edge case: re-applying the same override is idempotent
+    let resp = send_set_override(&tx, Some(PowerSource::Battery)).await;
+    assert!(matches!(resp, IpcResponse::Ok { .. }));
+    let status = query_status(&tx).await;
+    assert_eq!(status.forced_power_source, Some(PowerSource::Battery));
+
+    // Edge case: forcing source equal to detected source still tracks override
+    let resp = send_set_override(&tx, Some(PowerSource::Ac)).await;
+    assert!(matches!(resp, IpcResponse::Ok { .. }));
+    let status = query_status(&tx).await;
+    assert!(!status.enabled, "forced AC behaves like detected AC");
+    assert_eq!(status.forced_power_source, Some(PowerSource::Ac));
+
+    // Edge case: forcing Unknown is rejected
+    let resp = send_set_override(&tx, Some(PowerSource::Unknown)).await;
+    assert!(
+        matches!(resp, IpcResponse::Error { .. }),
+        "forcing Unknown should be rejected, got {resp:?}"
+    );
+    let status = query_status(&tx).await;
+    assert_eq!(
+        status.forced_power_source,
+        Some(PowerSource::Ac),
+        "rejected request must not mutate state"
+    );
+
+    // Clear override → effective source = detected (AC) → disabled
+    let resp = send_set_override(&tx, None).await;
+    assert!(matches!(resp, IpcResponse::Ok { .. }));
+
+    let status = query_status(&tx).await;
+    assert!(!status.enabled, "follows detected AC after clearing override");
+    assert_eq!(status.forced_power_source, None);
+
+    tx.send(EngineEvent::Shutdown).await.unwrap();
+    engine_handle.await.unwrap();
+}
+
+#[derive(Debug)]
+struct StatusSnapshot {
+    enabled: bool,
+    power_source: PowerSource,
+    forced_power_source: Option<PowerSource>,
+}
+
+/// Round-trip a Status request; doubles as a sync barrier on the engine task.
+async fn query_status(tx: &tokio::sync::mpsc::Sender<EngineEvent>) -> StatusSnapshot {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(EngineEvent::IpcRequest {
+        request: IpcRequest::Status,
+        reply: reply_tx,
+    })
+    .await
+    .unwrap();
+    match reply_rx.await.unwrap() {
+        IpcResponse::Status {
+            enabled,
+            power_source,
+            forced_power_source,
+            ..
+        } => StatusSnapshot {
+            enabled,
+            power_source,
+            forced_power_source,
+        },
+        other => panic!("expected Status, got {other:?}"),
+    }
+}
+
+async fn send_set_override(
+    tx: &tokio::sync::mpsc::Sender<EngineEvent>,
+    source: Option<PowerSource>,
+) -> IpcResponse {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(EngineEvent::IpcRequest {
+        request: IpcRequest::SetPowerOverride { source },
+        reply: reply_tx,
+    })
+    .await
+    .unwrap();
+    reply_rx.await.unwrap()
+}
+
 /// Test 7: IPC Freeze/Thaw commands and error on pid=0.
 #[tokio::test]
 async fn ipc_freeze_thaw() {
