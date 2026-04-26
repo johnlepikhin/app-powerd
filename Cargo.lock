@@ -69,7 +69,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app-powerd"
-version = "1.0.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "app-powerd-core",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "app-powerd-core"
-version = "1.0.0"
+version = "1.1.1"
 dependencies = [
  "async-trait",
  "humantime-serde",
