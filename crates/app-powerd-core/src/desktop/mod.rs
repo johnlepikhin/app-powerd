@@ -5,17 +5,25 @@ pub mod x11;
 
 pub mod wayland;
 
-pub use window::WindowInfo;
+pub use window::{Desktop, WindowInfo};
 
 use tokio::sync::mpsc;
 
 /// Events emitted by focus backends.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum FocusEvent {
     /// Active window changed.
     FocusChanged(WindowInfo),
     /// A window was closed.
     WindowClosed { window_id: u64 },
+    /// The current virtual desktop (workspace) changed.
+    /// X11 backend emits this on `_NET_CURRENT_DESKTOP` PropertyNotify.
+    WorkspaceChanged { desktop: u32 },
+    /// Some client (panel, launcher, taskbar) sent an `_NET_ACTIVE_WINDOW`
+    /// ClientMessage asking the WM to focus `window_id`.
+    /// Used to pre-thaw a frozen app before the WM dispatches the request.
+    ActivationRequested { window_id: u64 },
 }
 
 /// Trait for desktop focus tracking backends.

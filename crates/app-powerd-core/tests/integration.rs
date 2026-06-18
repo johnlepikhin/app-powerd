@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use app_powerd_core::config::Config;
-use app_powerd_core::desktop::WindowInfo;
+use app_powerd_core::desktop::{Desktop, WindowInfo};
 use app_powerd_core::engine::{Engine, EngineEvent};
 use app_powerd_core::ipc::protocol::{IpcRequest, IpcResponse};
 use app_powerd_core::state::AppState;
@@ -31,16 +31,13 @@ defaults:
 }
 
 fn make_window(id: u64, pid: u32, wm_class: &str) -> WindowInfo {
-    WindowInfo {
-        window_id: id,
-        pid: Some(pid),
-        title: Some(format!("Window {id}")),
-        wm_class: Some(wm_class.to_string()),
-        app_id: None,
-        executable: Some(wm_class.to_lowercase()),
-        cmdline: Some(format!("/usr/bin/{}", wm_class.to_lowercase())),
-        is_fullscreen: false,
-    }
+    let mut info = WindowInfo::new(id);
+    info.pid = Some(pid);
+    info.title = Some(format!("Window {id}"));
+    info.wm_class = Some(wm_class.to_string());
+    info.executable = Some(wm_class.to_lowercase());
+    info.cmdline = Some(format!("/usr/bin/{}", wm_class.to_lowercase()));
+    info
 }
 
 /// Test 1: Focus changes trigger correct state transitions.
@@ -598,6 +595,260 @@ async fn ipc_freeze_thaw() {
 
     tx.send(EngineEvent::Shutdown).await.unwrap();
     engine_handle.await.unwrap();
+}
+
+/// Test: WorkspaceChanged and ActivationRequested events are accepted by the
+/// engine and leave the running event loop intact. Real pre-thaw requires a
+/// process actually frozen via SIGSTOP, which integration tests can't simulate
+/// safely; this test just verifies the dispatch wiring.
+#[tokio::test]
+async fn pre_thaw_events_dispatch_cleanly() {
+    let config = test_config();
+    let config_path = std::path::PathBuf::from("/tmp/test-config.yaml");
+    let (engine, tx) = Engine::new(config, config_path).expect("engine init");
+    let engine_handle = tokio::spawn(engine.run());
+
+    // Track an app on desktop 3.
+    let mut window = make_window(1, 1000, "Tray");
+    window.desktop = Some(Desktop::Index(3));
+    tx.send(EngineEvent::FocusChanged(window)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Track a second app with desktop = None. WorkspaceChanged must never
+    // pre-thaw it because the engine filters on `desktop.is_some_and(...)`.
+    let window_no_desktop = make_window(2, 1001, "Sticky");
+    tx.send(EngineEvent::FocusChanged(window_no_desktop))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Snapshot states before sending WorkspaceChanged.
+    let before = query_app_list(&tx).await;
+    let sticky_before = before
+        .iter()
+        .find(|a| a.wm_class == Some("Sticky".to_string()))
+        .expect("Sticky tracked")
+        .state;
+
+    // Non-matching desktop — no-op.
+    tx.send(EngineEvent::WorkspaceChanged { desktop: 99 })
+        .await
+        .unwrap();
+    // Matching desktop — no-op too, because the app is Active, not Frozen.
+    tx.send(EngineEvent::WorkspaceChanged { desktop: 3 })
+        .await
+        .unwrap();
+    // Activation for unknown window — no-op.
+    tx.send(EngineEvent::ActivationRequested { window_id: 999 })
+        .await
+        .unwrap();
+
+    // Sanity barrier: engine still responsive.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(EngineEvent::IpcRequest {
+        request: IpcRequest::Status,
+        reply: reply_tx,
+    })
+    .await
+    .unwrap();
+    let response = reply_rx.await.unwrap();
+    assert!(matches!(response, IpcResponse::Status { .. }));
+
+    // Negative case: Sticky (desktop=None) must remain in its prior state —
+    // WorkspaceChanged for any desktop must not touch it.
+    let after = query_app_list(&tx).await;
+    let sticky_after = after
+        .iter()
+        .find(|a| a.wm_class == Some("Sticky".to_string()))
+        .expect("Sticky still tracked")
+        .state;
+    assert_eq!(
+        sticky_after, sticky_before,
+        "WorkspaceChanged must not touch apps with desktop=None"
+    );
+
+    tx.send(EngineEvent::Shutdown).await.unwrap();
+    engine_handle.await.unwrap();
+}
+
+/// Test: workspace change pre-thaws a real Frozen app.
+///
+/// Uses two child `sleep` processes whose PIDs can safely receive SIGSTOP /
+/// SIGCONT without affecting the test harness. The "Other" focus window must
+/// not target a critical PID (e.g. the test process itself) because its app
+/// would also get frozen after the suspend timer fires.
+#[tokio::test]
+async fn workspace_change_pre_thaws_frozen_app() {
+    // Spawn two sleeping children: one for the tracked app, one to steal focus.
+    let mut tray_child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn tray sleep");
+    let mut other_child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn other sleep");
+    let tray_pid = tray_child.id();
+    let other_pid = other_child.id();
+
+    let config = test_config();
+    let config_path = std::path::PathBuf::from("/tmp/test-config.yaml");
+    let (engine, tx) = Engine::new(config, config_path).expect("engine init");
+    let engine_handle = tokio::spawn(engine.run());
+
+    // Track an app on desktop 7.
+    let mut window = make_window(1, tray_pid, "Tray");
+    window.desktop = Some(Desktop::Index(7));
+    tx.send(EngineEvent::FocusChanged(window)).await.unwrap();
+
+    // Background it by focusing another (different-PID) window.
+    tx.send(EngineEvent::FocusChanged(make_window(2, other_pid, "Other")))
+        .await
+        .unwrap();
+
+    // Wait > suspend_delay (100ms) so the suspend timer fires → Tray becomes Frozen.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let apps = query_app_list(&tx).await;
+    let tray = apps
+        .iter()
+        .find(|a| a.wm_class == Some("Tray".to_string()))
+        .expect("Tray tracked");
+    assert_eq!(
+        tray.state,
+        AppState::Frozen,
+        "expected Tray to be Frozen after suspend_delay"
+    );
+
+    // Non-matching desktop — must stay Frozen.
+    tx.send(EngineEvent::WorkspaceChanged { desktop: 999 })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let apps = query_app_list(&tx).await;
+    let tray = apps
+        .iter()
+        .find(|a| a.wm_class == Some("Tray".to_string()))
+        .expect("Tray tracked");
+    assert_eq!(
+        tray.state,
+        AppState::Frozen,
+        "non-matching desktop must not pre-thaw"
+    );
+
+    // Matching desktop — must transition out of Frozen into Background.
+    tx.send(EngineEvent::WorkspaceChanged { desktop: 7 })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let apps = query_app_list(&tx).await;
+    let tray = apps
+        .iter()
+        .find(|a| a.wm_class == Some("Tray".to_string()))
+        .expect("Tray tracked");
+    assert_eq!(
+        tray.state,
+        AppState::Background,
+        "matching desktop must pre-thaw Frozen → Background"
+    );
+
+    tx.send(EngineEvent::Shutdown).await.unwrap();
+    engine_handle.await.unwrap();
+
+    // Best-effort cleanup of the helper children.
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(tray_pid as i32),
+        nix::sys::signal::Signal::SIGCONT,
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(tray_pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(other_pid as i32),
+        nix::sys::signal::Signal::SIGCONT,
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(other_pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let _ = tray_child.wait();
+    let _ = other_child.wait();
+}
+
+/// Test: workspace change pre-thaws a Frozen app whose desktop is `Desktop::All`
+/// (sticky window), regardless of which workspace we switch to.
+#[tokio::test]
+async fn workspace_change_pre_thaws_sticky_frozen_app() {
+    let mut tray_child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn tray sleep");
+    let mut other_child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn other sleep");
+    let tray_pid = tray_child.id();
+    let other_pid = other_child.id();
+
+    let config = test_config();
+    let config_path = std::path::PathBuf::from("/tmp/test-config.yaml");
+    let (engine, tx) = Engine::new(config, config_path).expect("engine init");
+    let engine_handle = tokio::spawn(engine.run());
+
+    // Sticky tray (visible on every workspace).
+    let mut window = make_window(1, tray_pid, "StickyTray");
+    window.desktop = Some(Desktop::All);
+    tx.send(EngineEvent::FocusChanged(window)).await.unwrap();
+    tx.send(EngineEvent::FocusChanged(make_window(2, other_pid, "Other")))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let apps = query_app_list(&tx).await;
+    let tray = apps
+        .iter()
+        .find(|a| a.wm_class == Some("StickyTray".to_string()))
+        .expect("StickyTray tracked");
+    assert_eq!(tray.state, AppState::Frozen);
+
+    // Any workspace switch should pre-thaw a sticky app.
+    tx.send(EngineEvent::WorkspaceChanged { desktop: 42 })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let apps = query_app_list(&tx).await;
+    let tray = apps
+        .iter()
+        .find(|a| a.wm_class == Some("StickyTray".to_string()))
+        .expect("StickyTray tracked");
+    assert_eq!(
+        tray.state,
+        AppState::Background,
+        "Desktop::All must pre-thaw on any workspace switch"
+    );
+
+    tx.send(EngineEvent::Shutdown).await.unwrap();
+    engine_handle.await.unwrap();
+
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(tray_pid as i32),
+        nix::sys::signal::Signal::SIGCONT,
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(tray_pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(other_pid as i32),
+        nix::sys::signal::Signal::SIGCONT,
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(other_pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let _ = tray_child.wait();
+    let _ = other_child.wait();
 }
 
 /// Test 8: Config reload rematches tracked apps — policy changes take effect.

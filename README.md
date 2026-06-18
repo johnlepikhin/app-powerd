@@ -337,6 +337,22 @@ Focus Backend ──→ FocusEvent ──→ Engine
  4. If all guards pass, the app is frozen (cgroup v2 freezer) or throttled (CPU limits)
  5. When the app regains focus, it is instantly resumed
 
+### Pre-thaw triggers (X11)
+
+The X11 backend additionally watches `_NET_CURRENT_DESKTOP` PropertyNotify
+and `_NET_ACTIVE_WINDOW` ClientMessage events on the root window. A frozen
+tracked app is *pre-thawed* (resumed and parked in Background with a fresh
+suspend timer) when:
+
+ - The user switches to a virtual desktop where the app's window claims to
+   live (matching `_NET_WM_DESKTOP`). Catches the common case of switching
+   to a workspace that hosts a window currently minimized to tray —
+   without this, the app stays SIGSTOP'd and cannot respond to tray-icon
+   activation, which would normally route via DBus through the still-frozen
+   process.
+ - A panel, taskbar or launcher sends an `_NET_ACTIVE_WINDOW` ClientMessage
+   targeting one of the app's tracked windows.
+
 ## Supported Environments
 
 | Environment    | Backend          | Protocol                            |

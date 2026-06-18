@@ -39,6 +39,19 @@ pub enum EngineEvent {
     WindowClosed {
         window_id: u64,
     },
+    /// User switched to a different virtual desktop (EWMH `_NET_CURRENT_DESKTOP`).
+    /// Engine pre-thaws any frozen tracked app whose window lives on this desktop
+    /// so the user can interact with it (open from tray, click) without waiting
+    /// for the next maintenance window.
+    WorkspaceChanged {
+        desktop: u32,
+    },
+    /// A panel/launcher requested activation of `window_id` via
+    /// `_NET_ACTIVE_WINDOW` ClientMessage. Engine pre-thaws the matching app
+    /// so it can actually respond before the WM hands the request over.
+    ActivationRequested {
+        window_id: u64,
+    },
     SuspendTimerFired {
         app_id: AppId,
     },
@@ -63,6 +76,12 @@ impl From<crate::desktop::FocusEvent> for EngineEvent {
             crate::desktop::FocusEvent::FocusChanged(w) => EngineEvent::FocusChanged(w),
             crate::desktop::FocusEvent::WindowClosed { window_id } => {
                 EngineEvent::WindowClosed { window_id }
+            }
+            crate::desktop::FocusEvent::WorkspaceChanged { desktop } => {
+                EngineEvent::WorkspaceChanged { desktop }
+            }
+            crate::desktop::FocusEvent::ActivationRequested { window_id } => {
+                EngineEvent::ActivationRequested { window_id }
             }
         }
     }
@@ -124,6 +143,12 @@ impl Engine {
             match event {
                 EngineEvent::FocusChanged(window) => self.handle_focus_changed(window),
                 EngineEvent::WindowClosed { window_id } => self.handle_window_closed(window_id),
+                EngineEvent::WorkspaceChanged { desktop } => {
+                    self.handle_workspace_changed(desktop)
+                }
+                EngineEvent::ActivationRequested { window_id } => {
+                    self.handle_activation_requested(window_id)
+                }
                 EngineEvent::SuspendTimerFired { app_id } => {
                     self.handle_suspend_timer(app_id).await
                 }

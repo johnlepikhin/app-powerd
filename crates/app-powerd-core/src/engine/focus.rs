@@ -93,6 +93,62 @@ impl Engine {
         }
     }
 
+    /// Pre-thaw any tracked frozen app whose window lives on the newly-active
+    /// virtual desktop. Without this, switching to a workspace where a frozen
+    /// app's window is unmapped (e.g., minimized to tray) leaves the user stuck
+    /// — no `_NET_ACTIVE_WINDOW` change happens because the WM has no
+    /// focusable window to activate.
+    #[instrument(skip(self), fields(desktop))]
+    pub(crate) fn handle_workspace_changed(&mut self, desktop: u32) {
+        if !self.should_manage() {
+            return;
+        }
+
+        let candidates: Vec<(AppId, std::time::Duration)> = self
+            .registry
+            .iter()
+            .filter(|(_, e)| e.state() == AppState::Frozen)
+            .filter(|(_, e)| e.window_info().desktop.is_some_and(|d| d.matches(desktop)))
+            .map(|(id, e)| (id.clone(), e.policy().suspend_delay))
+            .collect();
+
+        for (app_id, delay) in candidates {
+            self.pre_thaw_frozen(&app_id, delay, "workspace");
+        }
+    }
+
+    /// Pre-thaw a tracked frozen app whose window was targeted by an
+    /// `_NET_ACTIVE_WINDOW` ClientMessage from a panel or launcher. Without
+    /// this, the WM would forward the activation to a still-SIGSTOP'd process
+    /// that cannot answer.
+    #[instrument(skip(self))]
+    pub(crate) fn handle_activation_requested(&mut self, window_id: u64) {
+        if !self.should_manage() {
+            return;
+        }
+        let target = self
+            .registry
+            .iter()
+            .find(|(_, e)| e.has_window(window_id) && e.state() == AppState::Frozen)
+            .map(|(id, e)| (id.clone(), e.policy().suspend_delay));
+        if let Some((app_id, delay)) = target {
+            self.pre_thaw_frozen(&app_id, delay, "activation");
+        }
+    }
+
+    /// Thaw a frozen app and park it in Background with a fresh suspend timer.
+    /// We don't have a real focus event, so going straight to Active would
+    /// leave multiple apps Active simultaneously when several pre-thaws fire
+    /// for the same workspace. Background is the right resting state: a
+    /// subsequent real focus event promotes it to Active, otherwise it
+    /// re-freezes after `suspend_delay`.
+    #[instrument(skip(self))]
+    fn pre_thaw_frozen(&mut self, app_id: &AppId, suspend_delay: std::time::Duration, trigger: &'static str) {
+        info!(app_id = %app_id, trigger, "pre-thaw");
+        self.restore_to_background(app_id, AppState::Frozen);
+        self.schedule_suspend(app_id, suspend_delay);
+    }
+
     pub(crate) fn handle_window_closed(&mut self, window_id: u64) {
         if let Some(entry) = self.registry.remove_window(window_id) {
             info!(app_id = %entry.app_id(), "app removed (all windows closed)");

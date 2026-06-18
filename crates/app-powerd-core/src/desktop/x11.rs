@@ -2,6 +2,7 @@ use std::os::fd::AsRawFd;
 
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, info};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
@@ -23,6 +24,8 @@ pub struct X11Backend {
     utf8_string_atom: u32,
     net_wm_state_atom: u32,
     net_wm_state_fullscreen_atom: u32,
+    net_current_desktop_atom: u32,
+    net_wm_desktop_atom: u32,
 }
 
 impl X11Backend {
@@ -35,10 +38,17 @@ impl X11Backend {
         })?;
         let root = screen.root;
 
+        // PROPERTY_CHANGE: _NET_ACTIVE_WINDOW, _NET_CURRENT_DESKTOP on root.
+        // SUBSTRUCTURE_NOTIFY: required so the server delivers ClientMessage
+        // events sent to root by panels/launchers (e.g. `_NET_ACTIVE_WINDOW`
+        // activation requests). The mask also generates Create/Map/Configure/
+        // Reparent/UnmapNotify events for root's children — those are silently
+        // ignored by the match arms below.
         change_window_attributes(
             &conn,
             root,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+            &ChangeWindowAttributesAux::new()
+                .event_mask(EventMask::PROPERTY_CHANGE | EventMask::SUBSTRUCTURE_NOTIFY),
         )
         .map_err(|e| DesktopError::X11Connection(e.to_string()))?;
         conn.flush()
@@ -60,9 +70,34 @@ impl X11Backend {
             utf8_string_atom: intern(b"UTF8_STRING")?,
             net_wm_state_atom: intern(b"_NET_WM_STATE")?,
             net_wm_state_fullscreen_atom: intern(b"_NET_WM_STATE_FULLSCREEN")?,
+            net_current_desktop_atom: intern(b"_NET_CURRENT_DESKTOP")?,
+            net_wm_desktop_atom: intern(b"_NET_WM_DESKTOP")?,
             conn,
             root,
         })
+    }
+
+    /// Read `_NET_CURRENT_DESKTOP` from the root window.
+    fn get_current_desktop(&self) -> Option<u32> {
+        let reply = match get_property(
+            &self.conn,
+            false,
+            self.root,
+            self.net_current_desktop_atom,
+            AtomEnum::CARDINAL,
+            0,
+            1,
+        ) {
+            Ok(cookie) => cookie.reply().ok()?,
+            Err(e) => {
+                tracing::warn!(error = %e, "_NET_CURRENT_DESKTOP read failed");
+                return None;
+            }
+        };
+        if reply.value_len == 0 {
+            return None;
+        }
+        Some(u32::from_ne_bytes(reply.value[..4].try_into().ok()?))
     }
 
     fn get_property_reply(
@@ -134,6 +169,23 @@ impl X11Backend {
             }
         }
 
+        // _NET_WM_DESKTOP — virtual desktop the window claims to live on.
+        // Expected to survive Withdrawn per EWMH; some clients clear it on
+        // unmap. Used to pre-thaw on workspace switch when present.
+        if let Some(reply) =
+            self.get_property_reply(window_id, self.net_wm_desktop_atom, AtomEnum::CARDINAL, 1)
+        {
+            if reply.value_len > 0 {
+                // Skip truncated replies rather than synthesising a fake
+                // workspace 0 — `0` is a real workspace and we must not lie.
+                info.desktop = reply.value[..4]
+                    .try_into()
+                    .ok()
+                    .map(u32::from_ne_bytes)
+                    .map(super::window::Desktop::from_raw);
+            }
+        }
+
         info.is_fullscreen = self.check_fullscreen(window_id);
         info
     }
@@ -199,6 +251,41 @@ impl FocusBackend for X11Backend {
                             if tx.send(FocusEvent::FocusChanged(info)).await.is_err() {
                                 return Ok(());
                             }
+                        }
+                    }
+                    Event::PropertyNotify(ev) if ev.atom == self.net_current_desktop_atom => {
+                        if let Some(desktop) = self.get_current_desktop() {
+                            debug!(desktop, "workspace changed");
+                            // Hint-only: use try_send so an X event flood cannot
+                            // stall the backend on a slow consumer.
+                            match tx.try_send(FocusEvent::WorkspaceChanged { desktop }) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(_)) => {
+                                    debug!("focus channel full; dropping WorkspaceChanged hint");
+                                }
+                                Err(TrySendError::Closed(_)) => return Ok(()),
+                            }
+                        }
+                    }
+                    Event::ClientMessage(ev) if ev.type_ == self.active_window_atom => {
+                        // EWMH 1.3.5: _NET_ACTIVE_WINDOW ClientMessage uses
+                        // format=32; data[0] carries the source indicator
+                        // (1 = application, 2 = pager/taskbar). Source is
+                        // intentionally not validated — pre-thaw is a hint,
+                        // false positives are harmless.
+                        if ev.format != 32 {
+                            continue;
+                        }
+                        let window_id = u64::from(ev.window);
+                        debug!(window_id, "activation requested via ClientMessage");
+                        // Hint-only: use try_send so an X event flood cannot
+                        // stall the backend on a slow consumer.
+                        match tx.try_send(FocusEvent::ActivationRequested { window_id }) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                debug!("focus channel full; dropping ActivationRequested hint");
+                            }
+                            Err(TrySendError::Closed(_)) => return Ok(()),
                         }
                     }
                     Event::DestroyNotify(ev) => {
