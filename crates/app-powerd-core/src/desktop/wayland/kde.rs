@@ -1,3 +1,14 @@
+//! KDE Plasma focus tracking through a temporary KWin script.
+//!
+//! The backend owns a session D-Bus endpoint and loads the bundled `kwin.js`
+//! into KWin at runtime. The script observes window activation, closure, and
+//! fullscreen changes, then sends window metadata as JSON to that endpoint.
+//! This module maps KWin's UUID window identifiers to the numeric IDs used by
+//! [`FocusEvent`] and enriches events with process metadata from `/proc`.
+//!
+//! The script is unloaded and its temporary runtime file is removed when the
+//! backend stops, including cancellation through [`ScriptGuard`].
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
