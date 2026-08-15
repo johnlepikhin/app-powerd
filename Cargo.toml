@@ -24,7 +24,7 @@ thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
-nix = { version = "0.29", features = ["signal", "process", "user", "fs"] }
+nix = { version = "0.29", features = ["signal", "user", "fs"] }
 inotify = { version = "0.11", features = ["stream"] }
 x11rb = { version = "0.13", features = ["screensaver"] }
 zbus = "5"
