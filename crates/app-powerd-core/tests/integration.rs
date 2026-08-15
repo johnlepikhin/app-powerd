@@ -505,7 +505,10 @@ defaults:
     assert!(matches!(resp, IpcResponse::Ok { .. }));
 
     let status = query_status(&tx).await;
-    assert!(!status.enabled, "follows detected AC after clearing override");
+    assert!(
+        !status.enabled,
+        "follows detected AC after clearing override"
+    );
     assert_eq!(status.forced_power_source, None);
 
     tx.send(EngineEvent::Shutdown).await.unwrap();
@@ -702,9 +705,11 @@ async fn workspace_change_pre_thaws_frozen_app() {
     tx.send(EngineEvent::FocusChanged(window)).await.unwrap();
 
     // Background it by focusing another (different-PID) window.
-    tx.send(EngineEvent::FocusChanged(make_window(2, other_pid, "Other")))
-        .await
-        .unwrap();
+    tx.send(EngineEvent::FocusChanged(make_window(
+        2, other_pid, "Other",
+    )))
+    .await
+    .unwrap();
 
     // Wait > suspend_delay (100ms) so the suspend timer fires → Tray becomes Frozen.
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -800,9 +805,11 @@ async fn workspace_change_pre_thaws_sticky_frozen_app() {
     let mut window = make_window(1, tray_pid, "StickyTray");
     window.desktop = Some(Desktop::All);
     tx.send(EngineEvent::FocusChanged(window)).await.unwrap();
-    tx.send(EngineEvent::FocusChanged(make_window(2, other_pid, "Other")))
-        .await
-        .unwrap();
+    tx.send(EngineEvent::FocusChanged(make_window(
+        2, other_pid, "Other",
+    )))
+    .await
+    .unwrap();
 
     tokio::time::sleep(Duration::from_millis(250)).await;
     let apps = query_app_list(&tx).await;

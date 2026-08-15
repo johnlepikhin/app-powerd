@@ -143,9 +143,7 @@ impl Engine {
             match event {
                 EngineEvent::FocusChanged(window) => self.handle_focus_changed(window),
                 EngineEvent::WindowClosed { window_id } => self.handle_window_closed(window_id),
-                EngineEvent::WorkspaceChanged { desktop } => {
-                    self.handle_workspace_changed(desktop)
-                }
+                EngineEvent::WorkspaceChanged { desktop } => self.handle_workspace_changed(desktop),
                 EngineEvent::ActivationRequested { window_id } => {
                     self.handle_activation_requested(window_id)
                 }
