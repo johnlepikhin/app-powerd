@@ -47,13 +47,20 @@ function watch(window) {
     });
 }
 
-workspace.stackingOrder.forEach(watch);
-workspace.windowAdded.connect(watch);
-workspace.windowActivated.connect(function (window) {
+const plasma6 = workspace.windowAdded !== undefined;
+const windows = plasma6 ? workspace.stackingOrder : workspace.clientList();
+const windowAdded = plasma6 ? workspace.windowAdded : workspace.clientAdded;
+const windowActivated = plasma6 ? workspace.windowActivated : workspace.clientActivated;
+const windowRemoved = plasma6 ? workspace.windowRemoved : workspace.clientRemoved;
+const activeWindow = plasma6 ? workspace.activeWindow : workspace.activeClient;
+
+windows.forEach(watch);
+windowAdded.connect(watch);
+windowActivated.connect(function (window) {
     emit("focused", window);
 });
-workspace.windowRemoved.connect(function (window) {
+windowRemoved.connect(function (window) {
     emit("closed", window);
 });
 
-emit("focused", workspace.activeWindow);
+emit("focused", activeWindow);

@@ -45,7 +45,7 @@ struct KdeEvent {
 #[serde(rename_all = "camelCase")]
 struct KdeWindow {
     id: String,
-    pid: u32,
+    pid: i32,
     title: String,
     app_id: String,
     resource_class: String,
@@ -110,10 +110,11 @@ impl KdeWindow {
         info.is_fullscreen = self.fullscreen;
 
         if self.pid > 0 {
-            info.pid = Some(self.pid);
-            let cached = pid_cache.entry(self.pid).or_insert_with(|| {
-                let exe = crate::system::process::exe_name(self.pid).unwrap_or_default();
-                let cmdline = crate::system::process::cmdline(self.pid).ok();
+            let pid = self.pid as u32;
+            info.pid = Some(pid);
+            let cached = pid_cache.entry(pid).or_insert_with(|| {
+                let exe = crate::system::process::exe_name(pid).unwrap_or_default();
+                let cmdline = crate::system::process::cmdline(pid).ok();
                 crate::system::process::CachedProcessInfo { exe, cmdline }
             });
             info.executable = Some(cached.exe.clone());
@@ -326,5 +327,16 @@ mod tests {
         let closed = FOCUSED.replace("\"focused\"", "\"closed\"");
 
         assert!(mapper.map(&closed).unwrap().is_none());
+    }
+
+    #[test]
+    fn accepts_window_without_pid() {
+        let mut mapper = EventMapper::new();
+        let focused = FOCUSED.replace("\"pid\":0", "\"pid\":-1");
+
+        let Some(FocusEvent::FocusChanged(window)) = mapper.map(&focused).unwrap() else {
+            panic!("expected focus event");
+        };
+        assert_eq!(window.pid, None);
     }
 }
