@@ -9,7 +9,7 @@
 //! # Modules
 //!
 //! - [`config`] — YAML configuration loading, rules, profiles, matching
-//! - [`desktop`] — Focus tracking backends: X11, Wayland (wlr-toplevel), GNOME Shell
+//! - [`desktop`] — Focus tracking backends: X11, wlroots, KDE Plasma, GNOME Shell
 //! - [`engine`] — Main event loop coordinating all subsystems
 //! - [`guards`] — Safety checks before suspend: audio, camera, fullscreen, input idle
 //! - [`system`] — cgroup v2 management, process info, power source detection, systemd D-Bus

@@ -296,9 +296,9 @@ async fn run_client(command: Commands) -> Result<()> {
             println!("app-powerd status:");
             println!("  enabled:      {enabled}");
             match forced_power_source {
-                Some(forced) => println!(
-                    "  power source: {forced} (forced; detected: {power_source})"
-                ),
+                Some(forced) => {
+                    println!("  power source: {forced} (forced; detected: {power_source})")
+                }
                 None => println!("  power source: {power_source} (auto)"),
             }
             println!("  tracked apps: {tracked_apps}");

@@ -143,7 +143,12 @@ impl Engine {
     /// subsequent real focus event promotes it to Active, otherwise it
     /// re-freezes after `suspend_delay`.
     #[instrument(skip(self))]
-    fn pre_thaw_frozen(&mut self, app_id: &AppId, suspend_delay: std::time::Duration, trigger: &'static str) {
+    fn pre_thaw_frozen(
+        &mut self,
+        app_id: &AppId,
+        suspend_delay: std::time::Duration,
+        trigger: &'static str,
+    ) {
         info!(app_id = %app_id, trigger, "pre-thaw");
         self.restore_to_background(app_id, AppState::Frozen);
         self.schedule_suspend(app_id, suspend_delay);

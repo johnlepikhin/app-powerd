@@ -17,8 +17,7 @@ viewers are frozen aggressively.
 
 ## Features
 
- - **Automatic focus tracking** — X11 (via `x11rb`), Wayland (`wlr-foreign-toplevel` for Sway/Hyprland), GNOME Shell
-   (D-Bus Introspect)
+ - **Automatic focus tracking** — X11 (via `x11rb`), Wayland (`wlr-foreign-toplevel` for Sway/Hyprland), KDE Plasma (KWin scripting), GNOME Shell (D-Bus Introspect)
  - **cgroup v2 freeze/thaw** — true kernel-level process suspension, zero CPU usage
  - **CPU throttling** — adjustable `cpu.weight`, `cpu.max` quota, and process niceness
  - **Safety guards** — skip suspend if app is playing audio, using camera, fullscreen, or user is idle
@@ -63,7 +62,7 @@ cargo install app-powerd --no-default-features --features wayland
 cargo install app-powerd --features wayland
 ```
 
-GNOME Shell Introspect backend works via D-Bus and is always available regardless of feature flags.
+KDE Plasma and GNOME Shell backends work via D-Bus and are always available regardless of feature flags.
 
 ## Quick Start
 
@@ -331,7 +330,7 @@ Focus Backend ──→ FocusEvent ──→ Engine
                           └── Focus returns → instant resume
 ```
 
- 1. A focus backend (X11/Wayland/GNOME) detects window focus changes
+ 1. A focus backend (X11/Wayland/KDE/GNOME) detects window focus changes
  2. The engine starts a configurable delay timer for the unfocused app
  3. When the timer fires, safety guards are checked (audio, camera, fullscreen, idle)
  4. If all guards pass, the app is frozen (cgroup v2 freezer) or throttled (CPU limits)
@@ -359,6 +358,7 @@ suspend timer) when:
 | -------------- | ---------------- | ----------------------------------- |
 | X11            | `X11Backend`     | `_NET_ACTIVE_WINDOW` + XScreenSaver |
 | Sway, Hyprland | `WaylandBackend` | `wlr-foreign-toplevel-management`   |
+| KDE Plasma     | `KdeKWinBackend` | KWin scripting over D-Bus           |
 | GNOME Shell    | `GnomeBackend`   | D-Bus `org.gnome.Shell.Introspect`  |
 
 ## Cgroup Capabilities
