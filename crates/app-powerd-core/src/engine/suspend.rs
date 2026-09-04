@@ -7,6 +7,20 @@ impl Engine {
             return;
         };
 
+        // An application the policy says to leave alone must not reach the rest
+        // of this function: it would still expand the whole process tree, read
+        // `/proc` for every descendant and announce a transition that applies
+        // nothing. A timer can outlive the decision that scheduled it — the
+        // policy may have changed on reload, or protection may have forced
+        // `Ignore` after registration.
+        if entry.policy().action == Action::Ignore {
+            debug!(app_id = %app_id, "policy is ignore, not suspending");
+            if let Some(entry) = self.registry.get_mut(&app_id) {
+                entry.cancel_suspend_timer();
+            }
+            return;
+        }
+
         // Check resume grace
         if entry.in_resume_grace() {
             debug!(app_id = %app_id, "in resume grace, skipping suspend");
@@ -46,11 +60,12 @@ impl Engine {
         // closure, so a copy of it goes along.
         let base_pids = entry.pids();
         let policy = self.protection.clone();
+        let own_roots = base_pids.clone();
         let (procs, protected) = match tokio::time::timeout(
             DESCENDANT_PIDS_TIMEOUT,
             tokio::task::spawn_blocking(move || {
                 let expanded = freeze::expand_tree(&base_pids);
-                policy.partition(&expanded)
+                policy.partition(&expanded, &own_roots)
             }),
         )
         .await

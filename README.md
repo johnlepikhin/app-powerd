@@ -435,8 +435,13 @@ zenity, yad, kdialog, xmessage, pinentry*, ssh-askpass*,
 polkit-gnome-authentication-agent-1, lxpolkit, gcr-prompter
 ```
 
-As a second line of defence, any process owning a well-known name on the session bus is also spared.
-That check costs a little bus traffic and can be turned off with `defaults.protection.dbus_check`.
+As a second line of defence, a process that turns up **inside a managed application's process tree**
+and owns a well-known name on the session bus is also spared — the unknown helper or daemon the list
+above cannot enumerate in advance. This tier deliberately does not apply to the application itself:
+ordinary programs claim well-known names all the time (every media-capable browser registers
+`org.mpris.MediaPlayer2.*`, Telegram claims `org.telegram.desktop`), and sparing them would put the
+heaviest applications on the system permanently beyond management. The check costs a little bus
+traffic and can be turned off with `defaults.protection.dbus_check`.
 
 Applications covered by either rule appear as `PROTECTED` in `app-powerd list`, with the reason in
 the `RULE` column, and are counted in `app-powerd status`. If a rule of yours appears to be ignored,

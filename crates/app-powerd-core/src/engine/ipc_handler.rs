@@ -101,7 +101,11 @@ impl Engine {
         // The deny-list is not overridable by a manual command either: a user
         // freezing xdg-desktop-portal by hand breaks their session just as
         // thoroughly as a rule doing it.
-        let (allowed, protected) = self.protection.partition(&procs);
+        // Everything resolved here was named by the user, directly or through an
+        // application they asked for, so the session-bus tier does not apply —
+        // only the built-in deny-list, which is not overridable by hand either.
+        let own: Vec<u32> = procs.iter().map(|h| h.pid).collect();
+        let (allowed, protected) = self.protection.partition(&procs, &own);
         if allowed.is_empty() {
             let reason = protected
                 .first()

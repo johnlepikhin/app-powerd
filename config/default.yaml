@@ -32,8 +32,10 @@ defaults:
   reconcile_interval: "30s"
 
   protection:
-    # Also protect whoever owns a well-known name on the session bus. This is
-    # the safety net for infrastructure that is not in the built-in list.
+    # Also protect a process found inside a managed application's process tree
+    # that owns a well-known name on the session bus — the safety net for
+    # infrastructure the built-in list does not know. It does not apply to the
+    # application itself: browsers and messengers own bus names routinely.
     # Set to false to avoid the periodic bus traffic.
     dbus_check: true
     dbus_refresh_interval: "5m"

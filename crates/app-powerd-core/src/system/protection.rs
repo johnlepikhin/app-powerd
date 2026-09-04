@@ -117,16 +117,20 @@ impl ProtectionPolicy {
         self.dbus_owners = dbus_owners;
     }
 
-    /// Whether a process is protected, and why.
+    /// Whether an application the user is managing is protected, and why.
+    ///
+    /// Consults the built-in deny-list only. Owning a well-known bus name is
+    /// **not** grounds for exempting an application here: ordinary desktop
+    /// programs claim well-known names routinely — every media-capable browser
+    /// registers `org.mpris.MediaPlayer2.*`, Telegram claims
+    /// `org.telegram.desktop` — and treating that as infrastructure would put
+    /// exactly the heaviest applications permanently out of reach, which is the
+    /// opposite of what this daemon is for.
     ///
     /// `exe` is the executable basename when known. When it is `None` the
     /// kernel's `comm` is consulted, and if that is unavailable too the process
     /// is reported protected rather than assumed safe.
     pub fn check(&self, pid: u32, exe: Option<&str>) -> Option<ProtectionReason> {
-        if let Some(bus_name) = self.dbus_owners.get(&pid) {
-            return Some(ProtectionReason::DbusNameOwner(bus_name.clone()));
-        }
-
         let name = match exe {
             Some(e) if !e.is_empty() => Some(e.to_string()),
             _ => super::process::comm(pid),
@@ -138,8 +142,28 @@ impl ProtectionPolicy {
         }
     }
 
+    /// Whether a process that merely turned up in someone else's process tree is
+    /// protected, and why.
+    ///
+    /// Here the session-bus tier does apply: a helper or daemon that is not the
+    /// application being managed, and that owns a well-known name, is the case
+    /// the deny-list cannot enumerate in advance — an unknown service whose
+    /// disappearance would block clients on a D-Bus timeout.
+    pub fn check_foreign(&self, pid: u32, exe: Option<&str>) -> Option<ProtectionReason> {
+        if let Some(bus_name) = self.dbus_owners.get(&pid) {
+            return Some(ProtectionReason::DbusNameOwner(bus_name.clone()));
+        }
+        self.check(pid, exe)
+    }
+
     /// Split a process set into the part that may be suspended and the part that
     /// must not be.
+    ///
+    /// `own_roots` are the PIDs of the application itself. They are judged by
+    /// [`check`](Self::check) alone; everything else in the tree is foreign and
+    /// also faces the session-bus tier. Without that distinction an application
+    /// that owns a bus name would be excluded from its own suspension, leaving
+    /// its children stopped and its main process running.
     ///
     /// Applied to the expanded descendant tree, this is what stops a managed
     /// application from dragging session infrastructure down with it — a browser
@@ -148,11 +172,17 @@ impl ProtectionPolicy {
     pub fn partition(
         &self,
         procs: &[ProcessHandle],
+        own_roots: &[u32],
     ) -> (Vec<ProcessHandle>, Vec<(u32, ProtectionReason)>) {
         let mut allowed = Vec::with_capacity(procs.len());
         let mut protected = Vec::new();
         for &handle in procs {
-            match self.check(handle.pid, None) {
+            let verdict = if own_roots.contains(&handle.pid) {
+                self.check(handle.pid, None)
+            } else {
+                self.check_foreign(handle.pid, None)
+            };
+            match verdict {
                 Some(reason) => protected.push((handle.pid, reason)),
                 None => allowed.push(handle),
             }
@@ -288,39 +318,88 @@ mod tests {
     }
 
     /// The second tier must work on a name the static list has never heard of —
-    /// that is its whole purpose.
+    /// that is its whole purpose — but only for a foreign process.
     #[test]
-    fn dbus_owner_is_protected_without_a_bus() {
+    fn foreign_dbus_owner_is_protected_without_a_bus() {
         let mut policy = ProtectionPolicy::default();
         policy.apply_refresh(HashMap::from([(
             4242,
             "org.freedesktop.portal.Desktop".to_string(),
         )]));
         assert_eq!(
-            policy.check(4242, Some("some-unknown-daemon")),
+            policy.check_foreign(4242, Some("some-unknown-daemon")),
             Some(ProtectionReason::DbusNameOwner(
                 "org.freedesktop.portal.Desktop".to_string()
             ))
         );
     }
 
+    /// Owning a bus name must not exempt the application itself.
+    ///
+    /// Every media-capable browser registers `org.mpris.MediaPlayer2.*` and
+    /// Telegram claims `org.telegram.desktop`; treating that as infrastructure
+    /// put the heaviest applications permanently beyond management.
     #[test]
-    fn partition_splits_protected_from_allowed() {
+    fn an_applications_own_bus_name_does_not_exempt_it() {
         let mut policy = ProtectionPolicy::default();
-        policy.apply_refresh(HashMap::from([(100, "org.example".to_string())]));
+        policy.apply_refresh(HashMap::from([
+            (
+                4242,
+                "org.mpris.MediaPlayer2.chromium.instance4242".to_string(),
+            ),
+            (4243, "org.telegram.desktop".to_string()),
+        ]));
+        assert_eq!(policy.check(4242, Some("chrome")), None);
+        assert_eq!(policy.check(4243, Some("telegram-desktop")), None);
+    }
+
+    /// The same PID is judged differently depending on whether it is the
+    /// application being managed or something that merely turned up below it.
+    #[test]
+    fn partition_applies_the_bus_tier_only_to_foreign_processes() {
+        let mut policy = ProtectionPolicy::default();
+        policy.apply_refresh(HashMap::from([
+            (100, "org.mpris.MediaPlayer2.chromium".to_string()),
+            (200, "org.example.UnknownDaemon".to_string()),
+        ]));
         let procs = [
             ProcessHandle {
                 pid: 100,
                 starttime: 1,
             },
             ProcessHandle {
-                pid: std::process::id(),
+                pid: 200,
                 starttime: 2,
             },
         ];
-        let (allowed, protected) = policy.partition(&procs);
+
+        // 100 is the application itself, 200 is a stranger in its tree.
+        let (allowed, protected) = policy.partition(&procs, &[100]);
+        assert_eq!(
+            allowed.iter().map(|h| h.pid).collect::<Vec<_>>(),
+            vec![100],
+            "the application's own process must stay suspendable"
+        );
         assert_eq!(protected.len(), 1);
-        assert_eq!(protected[0].0, 100);
-        assert_eq!(allowed.len(), 1);
+        assert_eq!(protected[0].0, 200);
+
+        // With no roots declared, both are foreign and both are spared.
+        let (allowed, protected) = policy.partition(&procs, &[]);
+        assert!(allowed.is_empty());
+        assert_eq!(protected.len(), 2);
+    }
+
+    #[test]
+    fn partition_still_honours_the_builtin_list_for_own_processes() {
+        let policy = ProtectionPolicy::default();
+        // PID 0 resolves to no name at all, so it is unidentifiable and spared
+        // even when declared as the application's own.
+        let procs = [ProcessHandle {
+            pid: 0,
+            starttime: 1,
+        }];
+        let (allowed, protected) = policy.partition(&procs, &[0]);
+        assert!(allowed.is_empty());
+        assert_eq!(protected.len(), 1);
     }
 }

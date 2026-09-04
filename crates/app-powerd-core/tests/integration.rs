@@ -1450,6 +1450,78 @@ async fn manual_ipc_freeze_is_recorded_in_the_journal() {
     let _ = std::fs::remove_dir_all(journal_path.parent().unwrap());
 }
 
+/// Owning a well-known bus name must not exempt an application from management.
+///
+/// Every media-capable browser registers `org.mpris.MediaPlayer2.*` and Telegram
+/// claims `org.telegram.desktop`. Treating that as a reason to spare them put the
+/// two heaviest applications on the system permanently beyond the daemon's reach.
+#[tokio::test]
+async fn an_app_owning_a_bus_name_is_still_managed() {
+    let journal_path = temp_journal("bus-name-app");
+    let journal = app_powerd_core::state::FreezeJournal::load(journal_path.clone()).unwrap();
+    let config = reactive_config("");
+    let (engine, tx) = Engine::with_journal(
+        config,
+        std::path::PathBuf::from("/tmp/test-config.yaml"),
+        journal,
+    )
+    .expect("engine init");
+    let engine_handle = tokio::spawn(engine.run());
+
+    let target = TestProc::spawn();
+    let target_pid = target.pid();
+    let other = TestProc::spawn();
+
+    // The application itself owns a well-known name, exactly like a browser
+    // exposing MPRIS.
+    tx.send(EngineEvent::ProtectionRefreshed(
+        [(
+            target_pid,
+            "org.mpris.MediaPlayer2.chromium.instance1".to_string(),
+        )]
+        .into_iter()
+        .collect(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    tx.send(EngineEvent::FocusChanged(make_window(
+        1, target_pid, "Chromium",
+    )))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    tx.send(EngineEvent::FocusChanged(make_window(
+        2,
+        other.pid(),
+        "Other",
+    )))
+    .await
+    .unwrap();
+
+    wait_until(
+        || is_stopped(target_pid),
+        "an app owning a bus name to still be frozen",
+    )
+    .await;
+
+    let apps = query_app_list(&tx).await;
+    let info = apps
+        .iter()
+        .find(|a| a.app_id == "Chromium")
+        .expect("app is tracked");
+    assert!(
+        info.protected.is_none(),
+        "owning a bus name must not mark the application protected, got {:?}",
+        info.protected
+    );
+
+    tx.send(EngineEvent::Shutdown).await.unwrap();
+    engine_handle.await.unwrap();
+    let _ = std::fs::remove_dir_all(journal_path.parent().unwrap());
+}
+
 /// Switching to AC with `ac: disable` must resume everything.
 ///
 /// Regression cover for the interaction the report asked us to verify, and for
