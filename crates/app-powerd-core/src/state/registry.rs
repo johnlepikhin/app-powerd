@@ -33,7 +33,12 @@ impl AppRegistry {
         for &wid in entry.window_ids() {
             self.window_map.insert(wid, app_id.clone());
         }
-        self.apps.insert(app_id.clone(), entry);
+        // Dropping an AppEntry does not abort its timer tasks — a tokio
+        // JoinHandle detaches on drop — so a silently replaced entry would leave
+        // its old timers firing against the new one.
+        if let Some(mut displaced) = self.apps.insert(app_id.clone(), entry) {
+            displaced.cancel_all_timers();
+        }
         app_id
     }
 
@@ -44,10 +49,21 @@ impl AppRegistry {
 
         if entry.remove_window(window_id) {
             // No more windows — remove the app entirely
-            self.apps.remove(&app_id)
+            self.remove_app(&app_id)
         } else {
             None
         }
+    }
+
+    /// Remove an application and every window mapping pointing at it.
+    ///
+    /// Removing only the window that triggered the removal used to leave the
+    /// app's other window ids in `window_map` referring to an entry that no
+    /// longer exists.
+    pub fn remove_app(&mut self, app_id: &AppId) -> Option<AppEntry> {
+        let entry = self.apps.remove(app_id)?;
+        self.window_map.retain(|_, mapped| mapped != app_id);
+        Some(entry)
     }
 
     /// Iterate over all apps.

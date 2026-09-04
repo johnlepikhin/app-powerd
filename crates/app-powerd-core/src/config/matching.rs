@@ -65,9 +65,11 @@ impl RulesEngine {
         for rule in &self.compiled {
             if matches_rule(rule, ctx) {
                 debug!(rule_id = %rule.id, "rule matched");
-                return self
+                let mut policy = self
                     .config
                     .resolve_policy(&self.config.rules[rule.policy_index].policy);
+                policy.matched_rule = Some(rule.id.clone());
+                return policy;
             }
         }
 
@@ -84,6 +86,8 @@ fn compile_optional_regex(
     pattern: &Option<String>,
     rule_id: &str,
 ) -> Result<Option<Regex>, ConfigError> {
+    // Regexes stay case-sensitive: the pattern is authored by the user, who can
+    // opt into case-insensitivity explicitly with the inline `(?i)` flag.
     pattern
         .as_ref()
         .map(|r| {
@@ -126,21 +130,29 @@ fn compile_rule(rule: &Rule, index: usize) -> Result<CompiledRule, ConfigError> 
 }
 
 /// AND across fields, OR within field values.
+///
+/// Name comparisons are case-insensitive: the same program reaches us under
+/// different capitalisations depending on which desktop property carried it
+/// (`WM_CLASS` "Zenity" versus executable "zenity"), and a user writing a rule
+/// has no way to know which one will win.
 fn matches_rule(rule: &CompiledRule, ctx: &MatchContext) -> bool {
-    if !rule.executables.is_empty() && !rule.executables.iter().any(|e| e == &ctx.executable) {
+    fn any_eq(candidates: &[String], value: &str) -> bool {
+        candidates.iter().any(|c| c.eq_ignore_ascii_case(value))
+    }
+
+    if !rule.executables.is_empty() && !any_eq(&rule.executables, &ctx.executable) {
         return false;
     }
 
-    if !rule.wm_classes.is_empty() && !rule.wm_classes.iter().any(|c| c == &ctx.wm_class) {
+    if !rule.wm_classes.is_empty() && !any_eq(&rule.wm_classes, &ctx.wm_class) {
         return false;
     }
 
-    if !rule.app_ids.is_empty() && !rule.app_ids.iter().any(|a| a == &ctx.app_id) {
+    if !rule.app_ids.is_empty() && !any_eq(&rule.app_ids, &ctx.app_id) {
         return false;
     }
 
-    if !rule.desktop_files.is_empty() && !rule.desktop_files.iter().any(|d| d == &ctx.desktop_file)
-    {
+    if !rule.desktop_files.is_empty() && !any_eq(&rule.desktop_files, &ctx.desktop_file) {
         return false;
     }
 
@@ -257,5 +269,117 @@ rules:
         };
         let policy2 = engine.match_window(&ctx2);
         assert_eq!(policy2.action, crate::config::Action::Throttle);
+    }
+
+    /// The same program reaches us as `WM_CLASS` "Zenity" or executable
+    /// "zenity" depending on the backend, so name matching ignores case.
+    #[test]
+    fn wm_class_match_is_case_insensitive() {
+        let config = make_config(
+            r#"
+version: 1
+rules:
+  - id: zenity
+    match:
+      wm_class: [zenity]
+    policy:
+      action: throttle
+"#,
+        );
+        let engine = RulesEngine::new(config).unwrap();
+
+        for observed in ["Zenity", "zenity", "ZENITY"] {
+            let ctx = MatchContext {
+                wm_class: observed.into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                engine.match_window(&ctx).action,
+                crate::config::Action::Throttle,
+                "wm_class {observed} should match rule written as `zenity`"
+            );
+        }
+    }
+
+    /// ...and the rule may be the capitalised side of the pair.
+    #[test]
+    fn executable_match_is_case_insensitive() {
+        let config = make_config(
+            r#"
+version: 1
+rules:
+  - id: firefox
+    match:
+      executable: [Firefox]
+    policy:
+      action: throttle
+"#,
+        );
+        let engine = RulesEngine::new(config).unwrap();
+
+        let ctx = MatchContext {
+            executable: "firefox".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            engine.match_window(&ctx).action,
+            crate::config::Action::Throttle
+        );
+    }
+
+    /// Regexes are user-authored, so they stay case-SENSITIVE: `^Foo` must not
+    /// pull `foobar` under a different policy. Case-insensitivity is opt-in via
+    /// the inline `(?i)` flag.
+    #[test]
+    fn regex_match_is_case_sensitive() {
+        let config = make_config(
+            r#"
+version: 1
+rules:
+  - id: titled
+    match:
+      window_title_regex: "^Foo"
+    policy:
+      action: throttle
+"#,
+        );
+        let engine = RulesEngine::new(config).unwrap();
+
+        let lower = MatchContext {
+            window_title: "foobar".into(),
+            ..Default::default()
+        };
+        // Falls through to the default policy (Freeze), not the rule.
+        assert_eq!(
+            engine.match_window(&lower).action,
+            crate::config::Action::Freeze
+        );
+
+        let exact = MatchContext {
+            window_title: "Foobar".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            engine.match_window(&exact).action,
+            crate::config::Action::Throttle
+        );
+
+        // ...and the inline flag still works when the user asks for it.
+        let insensitive = make_config(
+            r#"
+version: 1
+rules:
+  - id: titled
+    match:
+      window_title_regex: "(?i)^Foo"
+    policy:
+      action: throttle
+"#,
+        );
+        let engine = RulesEngine::new(insensitive).unwrap();
+        assert_eq!(
+            engine.match_window(&lower).action,
+            crate::config::Action::Throttle
+        );
     }
 }

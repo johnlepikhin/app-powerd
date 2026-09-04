@@ -2,7 +2,86 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::SystemError;
+
+/// Stable identity of a running process: its PID together with the boot-relative
+/// start time from `/proc/<pid>/stat`.
+///
+/// A bare PID is not an identity — the kernel recycles PIDs, so a PID captured
+/// at freeze time may name an unrelated process by the time we try to thaw it.
+/// Pairing it with `starttime` makes the identity stable for the lifetime of the
+/// process and detectable as stale afterwards, which is what lets the daemon
+/// reap dead entries and safely restore state from a journal written by a
+/// previous run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProcessHandle {
+    pub pid: u32,
+    pub starttime: u64,
+}
+
+impl ProcessHandle {
+    /// Capture the identity of a currently running process.
+    ///
+    /// Returns `None` if the process does not exist or `/proc/<pid>/stat` cannot
+    /// be parsed.
+    pub fn open(pid: u32) -> Option<Self> {
+        if pid == 0 {
+            return None;
+        }
+        read_starttime(pid).map(|starttime| Self { pid, starttime })
+    }
+
+    /// Whether the process this handle names is still the same live process.
+    ///
+    /// A recycled PID yields a different `starttime` and is reported as dead,
+    /// which is the point: acting on it would target a stranger.
+    pub fn is_alive(&self) -> bool {
+        read_starttime(self.pid) == Some(self.starttime)
+    }
+
+    /// Whether the process is owned by the current user.
+    ///
+    /// Deliberately separate from [`is_alive`](Self::is_alive): identity says
+    /// *which* process this is, ownership says whether we may signal it. Both
+    /// are required before sending a signal on behalf of an IPC client or when
+    /// restoring from the journal.
+    pub fn is_owned(&self) -> bool {
+        is_owned_pid(self.pid)
+    }
+}
+
+/// Read field 22 (`starttime`) of `/proc/<pid>/stat`.
+fn read_starttime(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_starttime(&stat)
+}
+
+/// Extract field 22 (`starttime`) from the contents of a `/proc/<pid>/stat`
+/// record.
+///
+/// The `comm` field (2) is wrapped in parentheses and may itself contain spaces
+/// and parentheses, so the record is split at the *last* `)` rather than
+/// tokenized from the start. After that separator the remaining whitespace-
+/// separated fields begin at field 3, putting `starttime` at index 19.
+///
+/// Kept separate from the file read so the parsing — the part everything else
+/// depends on for process identity — can be tested against hostile input
+/// without a matching process having to exist.
+fn parse_starttime(stat: &str) -> Option<u64> {
+    let tail = &stat[stat.rfind(')')? + 1..];
+    tail.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Check if the given PID belongs to the current user.
+pub fn is_owned_pid(pid: u32) -> bool {
+    let Ok(metadata) = fs::metadata(format!("/proc/{pid}")) else {
+        return false;
+    };
+    use std::os::unix::fs::MetadataExt;
+    metadata.uid() == nix::unistd::getuid().as_raw()
+}
 
 /// Read /proc/PID/exe symlink to get executable path.
 pub(crate) fn exe_name(pid: u32) -> Result<String, SystemError> {
@@ -21,6 +100,18 @@ pub(crate) fn exe_name(pid: u32) -> Result<String, SystemError> {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| link.to_string_lossy().to_string()))
+}
+
+/// Read `/proc/PID/comm` — the kernel's short process name.
+///
+/// Used as a fallback identity when `/proc/<pid>/exe` is unreadable, which is
+/// common for processes the daemon did not launch. Returns `None` rather than an
+/// error because callers treat "no name" as its own signal.
+pub fn comm(pid: u32) -> Option<String> {
+    fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Read /proc/PID/cmdline.
@@ -161,6 +252,74 @@ fn parse_exec_from_desktop(content: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The parser must survive a `comm` containing both spaces and parentheses,
+    /// which is legal and appears in the wild (e.g. `(sd-pam)`, JVM threads).
+    #[test]
+    fn starttime_index_after_last_paren() {
+        // Fields 1..=22 with a hostile comm; starttime (field 22) is 987654.
+        let stat = "42 (weird ) name) S 1 42 42 0 -1 4194304 100 0 0 0 5 6 0 0 20 0 1 0 987654 \
+                    12345678 900 18446744073709551615";
+        assert_eq!(parse_starttime(stat), Some(987654));
+    }
+
+    /// A plain name must land on the same field — guards against an off-by-one
+    /// that a parenthesised-comm case alone would not reveal.
+    #[test]
+    fn starttime_with_ordinary_comm() {
+        let stat = "1 (systemd) S 0 1 1 0 -1 4194560 200 0 0 0 10 20 0 0 20 0 1 0 4242 \
+                    170000000 3000 18446744073709551615";
+        assert_eq!(parse_starttime(stat), Some(4242));
+    }
+
+    #[test]
+    fn starttime_rejects_malformed_records() {
+        assert_eq!(parse_starttime(""), None);
+        assert_eq!(parse_starttime("42 no-parens S 1"), None);
+        // Truncated: fewer than 22 fields.
+        assert_eq!(parse_starttime("42 (sh) S 1 42 42 0 -1"), None);
+    }
+
+    #[test]
+    fn process_handle_open_self_is_alive() {
+        let handle = ProcessHandle::open(std::process::id()).expect("own process is readable");
+        assert!(handle.is_alive());
+        assert!(handle.is_owned());
+    }
+
+    #[test]
+    fn process_handle_rejects_pid_zero() {
+        assert!(ProcessHandle::open(0).is_none());
+    }
+
+    /// A recycled PID must read as dead: same pid, different starttime.
+    #[test]
+    fn process_handle_detects_starttime_mismatch() {
+        let real = ProcessHandle::open(std::process::id()).unwrap();
+        let impostor = ProcessHandle {
+            pid: real.pid,
+            starttime: real.starttime.wrapping_add(1),
+        };
+        assert!(!impostor.is_alive());
+    }
+
+    #[test]
+    fn process_handle_open_reaped_child_is_none() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let pid = child.id();
+        child.wait().expect("reap child");
+        // After reaping, /proc/<pid> is gone, so no identity can be captured.
+        assert!(
+            ProcessHandle::open(pid).is_none() || !ProcessHandle::open(pid).unwrap().is_alive()
+        );
+    }
+
+    #[test]
+    fn comm_of_self_is_non_empty() {
+        assert!(comm(std::process::id()).is_some());
+    }
 
     #[test]
     fn read_self_exe_name() {

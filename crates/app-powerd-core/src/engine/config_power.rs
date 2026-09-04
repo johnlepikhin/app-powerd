@@ -43,12 +43,26 @@ impl Engine {
                         ctx.desktop_file = desktop_id.clone();
                     }
                 }
-                (id.clone(), ctx, entry.state(), entry.policy().action)
+                let protection = self.protection_verdict(entry.window_info());
+                (
+                    id.clone(),
+                    ctx,
+                    entry.state(),
+                    entry.policy().action,
+                    protection,
+                )
             })
             .collect();
 
-        for (app_id, ctx, state, old_action) in app_contexts {
-            let new_policy = self.rules_engine.match_window(&ctx);
+        for (app_id, ctx, state, old_action, protection) in app_contexts {
+            let mut new_policy = self.rules_engine.match_window(&ctx);
+            // A reloaded config must not be able to un-protect anything: the
+            // deny-list outranks configuration on reload exactly as it does on
+            // first registration.
+            if let Some(reason) = protection {
+                new_policy.action = Action::Ignore;
+                new_policy.matched_rule = Some(format!("built-in protection: {reason}"));
+            }
             let new_action = new_policy.action;
 
             // Update the policy
@@ -160,7 +174,8 @@ impl Engine {
             .collect();
 
         for (app_id, new_state, action) in transitions {
-            self.execute_transition(&app_id, new_state, action);
+            let procs = self.recorded_procs_for(&app_id);
+            self.execute_transition(&app_id, new_state, action, &procs);
         }
     }
 
@@ -176,6 +191,41 @@ impl Engine {
                     debug!(error = %e, "failed to remove cgroup during shutdown");
                 }
             }
+        }
+
+        self.release_journal_remnants();
+    }
+
+    /// Last-resort release of everything still recorded as suspended.
+    ///
+    /// The pass above is driven by the registry, whose state can be wrong or
+    /// incomplete — an entry may have been dropped while descendants stayed
+    /// stopped, or a thaw may have partially failed. The journal records what
+    /// was actually signalled, so it is the authority for what still has to be
+    /// released before the process that alone can release it exits.
+    fn release_journal_remnants(&mut self) {
+        if self.journal.is_empty() {
+            // The registry-driven pass already retired everything; drop the
+            // now-empty file so a restart does not have to reason about it.
+            if let Err(e) = self.journal.clear() {
+                warn!(error = %e, "failed to remove the emptied freeze journal");
+            }
+            return;
+        }
+
+        let (released, stuck) = self.release_recorded_processes();
+        if stuck > 0 {
+            // Deliberately left in the journal rather than cleared: the next
+            // start replays it, and this is the last moment anything can be
+            // recorded about processes that are still stopped.
+            warn!(
+                released,
+                stuck,
+                "shutdown: some processes could not be resumed; \
+                 they stay in the freeze journal for the next start"
+            );
+        } else {
+            info!(released, "shutdown: released remaining processes");
         }
     }
 }

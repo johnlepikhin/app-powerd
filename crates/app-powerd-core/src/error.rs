@@ -40,6 +40,16 @@ pub enum SystemError {
     #[error("process {pid} not found")]
     ProcessNotFound { pid: u32 },
 
+    /// The target process died before the operation reached it (`ESRCH`).
+    ///
+    /// This is an outcome, not a failure: a process that exited no longer needs
+    /// freezing or thawing. It is a distinct variant because the generic
+    /// [`SystemError::Nix`] carries no PID, and callers must know *which* PID to
+    /// drop from their bookkeeping — treating `ESRCH` as an ordinary error is
+    /// what let dead PIDs accumulate and re-signal forever.
+    #[error("process {pid} is gone")]
+    ProcessGone { pid: u32 },
+
     /// Failed to read process metadata from /proc.
     #[error("process {pid}: {message}")]
     ProcessReadError { pid: u32, message: String },
@@ -71,6 +81,34 @@ pub enum SystemError {
     /// Unix signal or errno error from the nix crate.
     #[error("nix errno: {0}")]
     Nix(#[from] nix::errno::Errno),
+}
+
+/// Errors from the freeze journal — the on-disk record of what is currently
+/// suspended.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum JournalError {
+    /// The journal file could not be read or written.
+    #[error("journal io error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// The journal file exists but could not be parsed as JSON.
+    #[error("journal at {path} is corrupt: {source}")]
+    Corrupt {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+
+    /// The journal was written by an incompatible version of the daemon.
+    #[error("journal at {path} has unsupported version {found} (expected {expected})")]
+    UnsupportedVersion {
+        path: PathBuf,
+        found: u32,
+        expected: u32,
+    },
 }
 
 /// Errors from desktop/display-server integration.

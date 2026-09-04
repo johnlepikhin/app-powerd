@@ -42,6 +42,13 @@ pub struct Defaults {
     pub timing: TimingConfig,
     pub maintenance_resume: MaintenanceResumeConfig,
     pub guards: GuardsConfig,
+    /// How often to re-check that tracked processes still exist.
+    ///
+    /// Exposed so the sweep can be slowed down or effectively disabled without
+    /// rebuilding, which is the escape hatch if it ever misbehaves in the field.
+    #[serde(with = "humantime_serde")]
+    pub reconcile_interval: Duration,
+    pub protection: ProtectionConfig,
 }
 
 impl Default for Defaults {
@@ -52,6 +59,33 @@ impl Default for Defaults {
             timing: TimingConfig::default(),
             maintenance_resume: MaintenanceResumeConfig::default(),
             guards: GuardsConfig::default(),
+            reconcile_interval: Duration::from_secs(30),
+            protection: ProtectionConfig::default(),
+        }
+    }
+}
+
+/// Tuning for the never-suspend protections.
+///
+/// The built-in deny-list itself is deliberately absent here: session
+/// infrastructure and modal dialogs must never be freezable, so there is no
+/// switch for it. Only the D-Bus second tier, which costs bus traffic, is
+/// configurable.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProtectionConfig {
+    /// Also protect processes owning a well-known name on the session bus.
+    pub dbus_check: bool,
+    /// How often to refresh the set of bus-owning processes.
+    #[serde(with = "humantime_serde")]
+    pub dbus_refresh_interval: Duration,
+}
+
+impl Default for ProtectionConfig {
+    fn default() -> Self {
+        Self {
+            dbus_check: true,
+            dbus_refresh_interval: Duration::from_secs(300),
         }
     }
 }
@@ -228,6 +262,12 @@ pub struct ResolvedPolicy {
     pub cpu_quota: Option<String>,
     pub maintenance_resume: MaintenanceResumeConfig,
     pub guards: GuardsConfig,
+    /// Id of the rule that matched, if any. Kept so `app-powerd list` can show
+    /// *why* an application is being treated the way it is — otherwise the only
+    /// way to find out is to re-derive the match by hand from the config.
+    pub matched_rule: Option<String>,
+    /// Name of the profile the rule referenced, if any.
+    pub matched_profile: Option<String>,
 }
 
 impl Default for ResolvedPolicy {
@@ -242,6 +282,8 @@ impl Default for ResolvedPolicy {
             cpu_quota: None,
             maintenance_resume: MaintenanceResumeConfig::default(),
             guards: GuardsConfig::default(),
+            matched_rule: None,
+            matched_profile: None,
         }
     }
 }
@@ -308,7 +350,22 @@ impl Config {
             cpu_quota,
             maintenance_resume,
             guards,
+            matched_rule: None,
+            matched_profile: policy.use_profile.clone(),
         }
+    }
+
+    /// Names of profiles that declare CPU controls, used at startup to warn when
+    /// those controls cannot be enforced.
+    pub fn profiles_requiring_cpu_control(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .profiles
+            .iter()
+            .filter(|(_, p)| p.cpu_weight.is_some() || p.cpu_quota.is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
     }
 
     /// Resolve the default policy (no rule matched).

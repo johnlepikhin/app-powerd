@@ -1,12 +1,28 @@
+pub(crate) mod apply;
 pub(crate) mod cgroup;
 pub(crate) mod freeze;
 /// Power source detection.
 pub mod power;
-pub(crate) mod process;
+/// Process identity and `/proc` inspection.
+pub mod process;
+pub(crate) mod protection;
 pub(crate) mod systemd_dbus;
 pub(crate) mod throttle;
 
+pub use process::ProcessHandle;
+
 use std::path::PathBuf;
+
+/// Per-user runtime directory for sockets, locks and the freeze journal.
+///
+/// The daemon and a standalone CLI invocation must agree on this path or
+/// emergency recovery silently finds nothing, so the fallback lives here rather
+/// than being duplicated at each call site.
+pub fn runtime_dir() -> PathBuf {
+    let dir = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
+    PathBuf::from(dir)
+}
 
 /// Sanitize a string to be a valid systemd unit name component.
 pub(crate) fn sanitize_unit_name(name: &str) -> String {

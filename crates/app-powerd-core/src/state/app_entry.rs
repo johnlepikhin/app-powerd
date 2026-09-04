@@ -4,18 +4,33 @@ use std::time::Instant;
 use tokio::task::JoinHandle;
 
 use super::machine::AppState;
+use super::process_set::ProcessSet;
 use crate::config::ResolvedPolicy;
 use crate::desktop::window::WindowInfo;
 
 /// Unique identifier for a tracked application.
-/// Based on executable name (groups multiple windows of same app).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AppId(String);
+///
+/// Derived from the window (wm_class > app_id > executable > window_id), which
+/// means the same program can present itself under different capitalisations —
+/// `zenity` reports `WM_CLASS` "Zenity" but an executable "zenity". Identity is
+/// therefore held case-insensitively in `key`, while `display` preserves the
+/// spelling the desktop actually used so output stays recognisable.
+///
+/// Case folding is ASCII-only, deliberately: rule matching
+/// (`config::matching`) and the protection deny-list both compare with
+/// `eq_ignore_ascii_case`. Folding identity over full Unicode here would make
+/// two names the same application while no rule written for either of them
+/// matches both.
+#[derive(Debug, Clone)]
+pub struct AppId {
+    key: String,
+    display: String,
+}
 
 impl AppId {
     /// Derive AppId from window info. Uses wm_class > app_id > executable > window_id.
     pub fn from_window(info: &WindowInfo) -> Self {
-        let id = info
+        let display = info
             .wm_class
             .as_deref()
             .filter(|s| !s.is_empty())
@@ -23,17 +38,46 @@ impl AppId {
             .or_else(|| info.executable.as_deref().filter(|s| !s.is_empty()))
             .map(String::from)
             .unwrap_or_else(|| format!("window-{}", info.window_id));
-        AppId(id)
+        Self::new(display)
     }
 
+    /// Build an AppId from an explicit name, e.g. one supplied over IPC.
+    pub fn new(display: impl Into<String>) -> Self {
+        let display = display.into();
+        Self {
+            key: display.to_ascii_lowercase(),
+            display,
+        }
+    }
+
+    /// The name as the desktop spelled it — for logs and CLI output.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.display
+    }
+
+    /// The case-folded identity used for lookup and comparison.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl PartialEq for AppId {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for AppId {}
+
+impl std::hash::Hash for AppId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key.hash(state);
     }
 }
 
 impl std::fmt::Display for AppId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.display)
     }
 }
 
@@ -41,7 +85,14 @@ impl std::fmt::Display for AppId {
 pub struct AppEntry {
     pub(crate) app_id: AppId,
     pub(crate) state: AppState,
-    pub(crate) pids: Vec<u32>,
+    /// Processes that own this application's windows.
+    ///
+    /// Deliberately *not* the full descendant tree. These identify the
+    /// application and are cheap to re-check every reconcile tick; the far
+    /// larger set of processes actually signalled is recorded in the freeze
+    /// journal instead, where it outlives this entry and can still be thawed
+    /// after the main process dies.
+    pub(crate) roots: ProcessSet,
     pub(crate) window_ids: Vec<u64>,
     pub(crate) window_info: WindowInfo,
     pub(crate) policy: ResolvedPolicy,
@@ -61,12 +112,18 @@ pub struct AppEntry {
 impl AppEntry {
     pub fn new(app_id: AppId, window_info: WindowInfo, policy: ResolvedPolicy) -> Self {
         let now = Instant::now();
-        let pids = window_info.pid.into_iter().collect();
+        let mut roots = ProcessSet::default();
+        if let Some(pid) = window_info.pid {
+            // A window whose PID cannot be identified still deserves tracking —
+            // we follow its state and its rules — it simply owns no process we
+            // are willing to signal.
+            roots.insert_pid(pid);
+        }
 
         Self {
             app_id,
             state: AppState::Active,
-            pids,
+            roots,
             window_ids: vec![window_info.window_id],
             window_info,
             policy,
@@ -92,8 +149,18 @@ impl AppEntry {
         self.state_since
     }
 
-    pub fn pids(&self) -> &[u32] {
-        &self.pids
+    /// PIDs of the window-owning processes.
+    pub fn pids(&self) -> Vec<u32> {
+        self.roots.pids()
+    }
+
+    /// Identities of the window-owning processes.
+    pub fn roots(&self) -> &ProcessSet {
+        &self.roots
+    }
+
+    pub fn roots_mut(&mut self) -> &mut ProcessSet {
+        &mut self.roots
     }
 
     pub fn policy(&self) -> &ResolvedPolicy {
@@ -114,14 +181,25 @@ impl AppEntry {
 
     // --- Mutating methods ---
 
-    pub fn add_pid(&mut self, pid: u32) {
-        if !self.pids.contains(&pid) {
-            self.pids.push(pid);
-        }
+    /// Record a newly seen window-owning PID, capturing its identity.
+    ///
+    /// Returns the captured handle, or `None` if the process could not be
+    /// identified (already exited, or `/proc` unreadable).
+    pub fn add_pid(&mut self, pid: u32) -> Option<crate::system::ProcessHandle> {
+        self.roots.insert_pid(pid)
     }
 
     pub fn contains_pid(&self, pid: u32) -> bool {
-        self.pids.contains(&pid)
+        self.roots.contains_pid(pid)
+    }
+
+    /// Whether every process this application ever owned has exited.
+    ///
+    /// False for an entry that never learned a PID: that is an identification
+    /// gap, not a dead application, and removing it would lose a window we are
+    /// still tracking.
+    pub fn is_defunct(&self) -> bool {
+        self.roots.is_empty() && self.roots.had_live_procs()
     }
 
     pub fn update_window_info(&mut self, info: WindowInfo) {

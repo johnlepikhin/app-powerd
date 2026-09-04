@@ -69,7 +69,30 @@ async fn handle_connection(
     mut stream: tokio::net::UnixStream,
     engine_tx: mpsc::Sender<EngineEvent>,
 ) -> std::io::Result<()> {
-    let request: IpcRequest = protocol::read_message(&mut stream).await?;
+    // Read the frame, then decode. Bailing out on a decode error used to close
+    // the socket without a reply, and the client reported that as "daemon not
+    // running" — advice that leads the user to kill a daemon which is the only
+    // thing able to release the processes it has suspended.
+    let raw = match protocol::read_frame(&mut stream).await {
+        Ok(raw) => raw,
+        Err(e) => return Err(e),
+    };
+    let request: IpcRequest = match serde_json::from_slice(&raw) {
+        Ok(request) => request,
+        Err(e) => {
+            debug!(error = %e, "IPC request could not be decoded");
+            let response = IpcResponse::Error {
+                message: format!(
+                    "protocol mismatch: this daemon speaks protocol v{} — \
+                     the running daemon is probably an older build than the CLI; \
+                     restart the daemon",
+                    protocol::PROTOCOL_VERSION
+                ),
+            };
+            protocol::write_message(&mut stream, &response).await?;
+            return Ok(());
+        }
+    };
     debug!(?request, "IPC request received");
 
     let (reply_tx, reply_rx) = oneshot::channel();

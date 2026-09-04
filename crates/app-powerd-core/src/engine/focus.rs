@@ -1,7 +1,10 @@
 use super::*;
 
 impl Engine {
-    #[instrument(skip(self))]
+    /// `window` is skipped from the span on purpose: its `Debug` form carries
+    /// the window title and command line, which would put document names, chat
+    /// topics and URLs into the log on every focus change.
+    #[instrument(skip(self, window), fields(window_id = window.window_id))]
     pub(crate) fn handle_focus_changed(&mut self, window: WindowInfo) {
         METRICS.focus_changes_total.fetch_add(1, Ordering::Relaxed);
 
@@ -28,7 +31,13 @@ impl Engine {
 
         if action != TransitionAction::NoOp {
             info!(app_id = %app_id, from = %old_state, to = %new_state, "activating");
-            self.execute_transition(app_id, new_state, action);
+            // Thawing acts on the journal's record, which includes descendants
+            // the registry never saw.
+            let procs = self.recorded_procs_for(app_id);
+            self.execute_transition(app_id, new_state, action, &procs);
+            // A user-driven activation clears the failure history: whatever was
+            // wrong may well have been resolved by the app being interacted with.
+            self.suspend_failures.remove(app_id);
         }
 
         // Move new PID to existing cgroup if needed
@@ -46,7 +55,9 @@ impl Engine {
                     }
                 }
                 if let Some(entry) = self.registry.get_mut(app_id) {
-                    entry.add_pid(pid);
+                    if entry.add_pid(pid).is_none() {
+                        debug!(pid, "window pid could not be identified, not tracking it");
+                    }
                 }
             }
         }
@@ -65,13 +76,54 @@ impl Engine {
                 ctx.desktop_file = desktop_id.clone();
             }
         }
-        let policy = self.rules_engine.match_window(&ctx);
+        let mut policy = self.rules_engine.match_window(&ctx);
+
+        // Protection is applied here, at policy resolution, rather than at the
+        // moment of freezing. An application forced to `Ignore` never gets a
+        // suspend timer at all, so "never frozen under any rule" holds by
+        // construction instead of depending on a check further down the path.
+        if let Some(reason) = self.protection_verdict(&window) {
+            if policy.action != Action::Ignore {
+                METRICS
+                    .protection_blocks_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if self
+                    .rate_limiter
+                    .allow(LogKey::app(app_id.as_str(), "protected"))
+                {
+                    warn!(
+                        app_id = %app_id,
+                        reason = %reason,
+                        requested = ?policy.action,
+                        "refusing to manage a protected process; \
+                         the built-in deny-list overrides configuration"
+                    );
+                }
+            }
+            policy.action = Action::Ignore;
+            policy.matched_rule = Some(format!("built-in protection: {reason}"));
+        }
+
         info!(app_id = %app_id, action = ?policy.action, "new app tracked");
 
         let entry = AppEntry::new(app_id.clone(), window, policy);
         self.registry.insert(entry);
 
         self.setup_cgroup(&app_id);
+    }
+
+    /// Whether this window's process must never be suspended.
+    pub(crate) fn protection_verdict(&self, window: &WindowInfo) -> Option<ProtectionReason> {
+        let exe = window.executable.as_deref();
+        match window.pid {
+            Some(pid) => self.protection.check(pid, exe),
+            // No PID at all: nothing can be signalled anyway, and treating an
+            // identification gap as "safe to freeze" is how a deny-list gets
+            // bypassed.
+            None => exe
+                .and_then(|e| self.protection.check(0, Some(e)))
+                .or(Some(ProtectionReason::Unidentifiable)),
+        }
     }
 
     fn background_other_active_apps(&mut self, focused_app: &AppId) {
@@ -88,7 +140,8 @@ impl Engine {
         for (other_id, new_state, action, old_state) in transitions {
             if action != TransitionAction::NoOp {
                 info!(app_id = %other_id, from = %old_state, to = %new_state, "backgrounding");
-                self.execute_transition(&other_id, new_state, action);
+                // Backgrounding only starts a timer; it touches no process.
+                self.execute_transition(&other_id, new_state, action, &[]);
             }
         }
     }
@@ -143,34 +196,49 @@ impl Engine {
     /// subsequent real focus event promotes it to Active, otherwise it
     /// re-freezes after `suspend_delay`.
     #[instrument(skip(self))]
-    fn pre_thaw_frozen(&mut self, app_id: &AppId, suspend_delay: std::time::Duration, trigger: &'static str) {
+    fn pre_thaw_frozen(
+        &mut self,
+        app_id: &AppId,
+        suspend_delay: std::time::Duration,
+        trigger: &'static str,
+    ) {
         info!(app_id = %app_id, trigger, "pre-thaw");
         self.restore_to_background(app_id, AppState::Frozen);
         self.schedule_suspend(app_id, suspend_delay);
     }
 
     pub(crate) fn handle_window_closed(&mut self, window_id: u64) {
-        if let Some(entry) = self.registry.remove_window(window_id) {
-            info!(app_id = %entry.app_id(), "app removed (all windows closed)");
+        let Some(entry) = self.registry.remove_window(window_id) else {
+            return;
+        };
+        info!(app_id = %entry.app_id(), "app removed (all windows closed)");
 
-            let elapsed_ms = entry.state_since().elapsed().as_millis() as u64;
+        let app_id = entry.app_id().clone();
+        let elapsed_ms = entry.state_since().elapsed().as_millis() as u64;
+        let cgroup_path = entry.cgroup_path_buf();
 
-            // Restore app to normal state before removing
-            self.restore_app_resources(
-                entry.app_id(),
-                entry.state(),
-                entry.cgroup_path_ref(),
-                entry.pids(),
-                elapsed_ms,
-            );
+        // Release the app before dropping it. The set comes from the journal so
+        // descendants are covered: a window can close while helper processes it
+        // spawned are still stopped, and once the entry is gone nothing else
+        // would ever revisit them. Anything that fails to release stays in the
+        // journal for the periodic sweep and for shutdown.
+        let procs = self.recorded_procs_for(&app_id);
+        self.restore_app_resources(
+            &app_id,
+            entry.state(),
+            cgroup_path.as_deref(),
+            &procs,
+            elapsed_ms,
+        );
 
-            // Clean up cgroup
-            if let Some(path) = entry.cgroup_path_ref() {
-                if let Err(e) = self.cgroup_mgr.remove_cgroup(path) {
-                    warn!(app_id = %entry.app_id(), error = %e, "failed to remove cgroup on window close");
-                }
+        if let Some(path) = cgroup_path.as_deref() {
+            if let Err(e) = self.cgroup_mgr.remove_cgroup(path) {
+                debug!(app_id = %app_id, error = %e, "failed to remove cgroup on window close");
             }
         }
+
+        self.suspend_failures.remove(&app_id);
+        self.rate_limiter.forget_app(app_id.as_str());
     }
 
     pub(crate) fn setup_cgroup(&mut self, app_id: &AppId) {
@@ -183,7 +251,7 @@ impl Engine {
             if entry.policy().action == Action::Ignore {
                 return;
             }
-            entry.pids().to_vec()
+            entry.pids()
         };
 
         match self.cgroup_mgr.create_cgroup(app_id.as_str(), &pids) {
