@@ -8,12 +8,35 @@
 #   Use a single field per rule unless you need exact AND filtering.
 #
 # Rule order matters: first match wins.
+#
+# Name matching (executable, wm_class, app_id) is case-insensitive, and so are
+# the cmdline/window-title regexes.
+#
+# Built-in protection: session infrastructure (xdg-desktop-portal, pipewire,
+# dbus-daemon, gvfsd, polkit, ...) and modal dialogs (zenity, pinentry,
+# ssh-askpass, ...) are NEVER suspended. That list is compiled in, takes
+# precedence over every rule below, and cannot be switched off — freezing a
+# portal blocks every application that talks to it, and freezing a dialog hangs
+# whatever is waiting for the user's answer. `app-powerd list` shows such
+# applications as PROTECTED.
 # ============================================================
 
 version: 1
 
 defaults:
   enabled: true
+
+  # How often to verify that tracked processes still exist. Applications whose
+  # processes have all exited are dropped here, which is what prevents the
+  # daemon from signalling PIDs that no longer exist.
+  reconcile_interval: "30s"
+
+  protection:
+    # Also protect whoever owns a well-known name on the session bus. This is
+    # the safety net for infrastructure that is not in the built-in list.
+    # Set to false to avoid the periodic bus traffic.
+    dbus_check: true
+    dbus_refresh_interval: "5m"
 
   mode:
     ac: disable

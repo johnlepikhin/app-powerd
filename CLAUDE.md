@@ -27,14 +27,25 @@ crates/
 
 | Модуль | Назначение |
 |--------|-----------|
-| `engine` | Главный event loop, координация всех подсистем |
-| `config/` | YAML конфигурация, правила, профили, matching |
+| `engine` | Главный event loop, координация всех подсистем, тик согласования, rate limiting |
+| `config/` | YAML конфигурация, правила, профили, matching (регистронезависимый) |
 | `desktop/` | Focus tracking: X11, Wayland (wlr-toplevel, GNOME Introspect) |
 | `guards/` | Проверки перед suspend: audio, camera, fullscreen, input idle |
-| `system/` | cgroup v2, freeze/thaw, throttle, process info, power source, systemd D-Bus |
-| `state/` | State machine (Active→Background→Throttled/Frozen), AppRegistry |
+| `system/` | cgroup v2, freeze/thaw, throttle, `ProcessHandle`, `ProtectionPolicy`, power source, systemd D-Bus |
+| `state/` | State machine (Active→Background→Throttled/Frozen), AppRegistry, `ProcessSet`, `FreezeJournal` |
 | `ipc/` | Unix socket IPC: protocol, server, client |
-| `metrics` | Atomic counters: frozen/thawed/throttled totals, time_in_frozen/throttled |
+| `metrics` | Atomic counters: frozen/thawed/throttled, reap, protection, journal |
+
+### Инварианты, которые нельзя ломать
+
+- **Журнал пишется до первого сигнала** (`arm` → `freeze_app` → `commit`) и очищается после
+  последнего (`retire`). `SIGSTOP` необратим извне: остановленный и незаписанный процесс
+  восстановить некому.
+- **Не смог записать журнал — не морозим.** `arm` вернул ошибку → заморозка отменяется.
+- **Идентичность процесса — это `(pid, starttime)`**, а не голый PID. Ядро переиспользует PID.
+- **Встроенный deny-list приоритетнее конфига** и не отключается: заморозка портала или диалога
+  вешает не только их.
+- **Удаление приложения из реестра определяется жизнью процессов**, а не событиями окон.
 
 ### Event Flow
 
@@ -75,7 +86,7 @@ GNOME Shell Introspect backend работает через `zbus` и досту�
 
 Файл: `~/.config/app-powerd/config.yaml` (пример: `config/default.yaml`)
 
-Структура: `version`, `defaults` (mode, timing, guards, maintenance_resume), `profiles`, `rules`.
+Структура: `version`, `defaults` (enabled, mode, timing, maintenance_resume, guards, reconcile_interval, protection), `profiles`, `rules`.
 
 Reload: `app-powerd reload-config` или SIGHUP или inotify watch.
 
@@ -95,7 +106,11 @@ Unix socket: `$XDG_RUNTIME_DIR/app-powerd.sock`
 
 Protocol: length-prefixed JSON (4 bytes u32 BE + JSON payload).
 
-Commands: `List`, `Status`, `Stats`, `Freeze{pid}`, `Thaw{pid}`, `ReloadConfig`, `Shutdown`.
+Commands: `List`, `Status`, `Stats`, `Freeze { target: Target }`, `Thaw { target: Target }`, `ThawAll`, `ReloadConfig`, `SetPowerOverride { source: Option<PowerSource> }`, `Shutdown`.
+
+`Target` — `untagged`-энум: `Pid { pid }` (совместим с 1.x-формой `{"pid": N}`) или `App { app }`.
+Поле `target` попадает в запрос через `#[serde(flatten)]`, поэтому запрос с обоими полями сразу
+разбирается как `Pid` — клиент обязан слать ровно одно из них.
 
 ## Conventions
 

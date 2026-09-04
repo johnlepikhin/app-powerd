@@ -30,6 +30,10 @@ viewers are frozen aggressively.
  - **IPC interface** — Unix socket with JSON protocol for status, metrics, manual freeze/thaw
  - **Graceful degradation** — auto-detects cgroup capabilities: direct write → systemd transient scopes →
    SIGSTOP/SIGCONT fallback
+ - **Protected processes** — session infrastructure and modal dialogs are never suspended, overriding
+   configuration ([details](#protected-processes))
+ - **Crash-safe suspension** — a freeze journal lets a killed daemon's victims be resumed on restart,
+   or by `app-powerd thaw-all` with no daemon at all
 
 ## Installation
 
@@ -86,14 +90,16 @@ The daemon automatically creates a default config at `~/.config/app-powerd/confi
 app-powerd <COMMAND>
 
 Commands:
-  run            Start the daemon
-  status         Show daemon status
-  list           List tracked applications
-  stats          Show daemon metrics (freeze/thaw/throttle counters)
-  freeze <PID>   Force-freeze a process by PID
-  thaw <PID>     Force-thaw a process by PID
-  reload-config  Reload configuration from disk
-  shutdown       Gracefully stop the daemon
+  run              Start the daemon
+  status           Show daemon status
+  list             List tracked applications
+  stats            Show daemon metrics
+  freeze <TARGET>  Force-freeze a PID or a tracked application by name
+  thaw <TARGET>    Force-thaw a PID or a tracked application by name
+  thaw-all         Resume everything app-powerd suspended (works without a daemon)
+  reload-config    Reload configuration from disk
+  force <MODE>     Override the detected power source (battery|ac|auto)
+  shutdown         Gracefully stop the daemon
 ```
 
 ### Examples
@@ -104,17 +110,33 @@ app-powerd run --config ~/my-config.yaml
 
 # Check what the daemon is managing
 app-powerd list
-# APP                  STATE        PIDs     TITLE
-# ------------------------------------------------------------------------
-# firefox              Throttled    1234     GitHub - Mozilla Firefox
-# TelegramDesktop      Frozen       5678     Telegram
+# APP                  STATE       IN STATE   PROFILE      RULE               PIDS      TITLE
+# --------------------------------------------------------------------------------------------
+# firefox              THROTTLED   4m12s      browser      firefox            37        GitHub - Mozilla Firefox
+# TelegramDesktop      FROZEN      1h03m      messenger    telegram           3         Telegram
+# Zenity               PROTECTED   8s         -            built-in protec... 1         Add a new entry
+
+# Check which suspension mechanism is actually in use
+app-powerd status
+# app-powerd status:
+#   enabled:       true
+#   power source:  battery (auto)
+#   cgroup mode:   SignalOnly
+#   cpu control:   unavailable (cpu_weight/cpu_quota are NOT applied)
+#   tracked apps:  11
+#   protected:     2
+#   uptime:        3821s
+#   protocol:      v2
 
 # View metrics
 app-powerd stats
 
-# Manually freeze/thaw a process
+# Manually freeze/thaw, by PID or by application name
 app-powerd freeze 1234
-app-powerd thaw 1234
+app-powerd thaw TelegramDesktop
+
+# Emergency: resume everything, even with no daemon running
+app-powerd thaw-all
 ```
 
 ## Configuration
@@ -371,6 +393,76 @@ The daemon auto-detects the best available cgroup control method:
 | **SystemdTransient** | Creates transient systemd scopes via D-Bus | User session with systemd                                     |
 | **SignalOnly**       | Falls back to `SIGSTOP`/`SIGCONT`          | Always available                                              |
 
+`app-powerd status` reports the mode in use. On a system without cgroup delegation the daemon warns
+**once** at startup and runs in `SignalOnly`, where `nice` still applies but **`cpu_weight` and
+`cpu_quota` do not** — profiles that declare them are named in that warning. This is expected on
+distributions that do not delegate a cgroup subtree to the user session, and the daemon is designed
+to work correctly there; it does not require cgroups.
+
+### Signal mode and recovery
+
+`SIGSTOP` cannot be undone by the process it stops, so a daemon that dies without releasing its
+charges would strand them permanently. Two mechanisms prevent that:
+
+- **Freeze journal** — `$XDG_RUNTIME_DIR/app-powerd/frozen.json` records what is suspended, written
+  before the first signal and cleared after the last. Each entry stores the PID *and* its start time,
+  so a recycled PID is never signalled by mistake. On startup the daemon replays it.
+- **`app-powerd thaw-all`** — resumes everything, and works with no daemon running: if nothing holds
+  the instance lock it replays the journal directly. This is the recovery path after `kill -9`.
+
+If the daemon is stopped by other means and processes are left stopped, they can be found with:
+
+```bash
+ps -eo pid,stat,comm --no-headers | awk '$2 ~ /T/'
+```
+
+## Protected processes
+
+Some processes are never suspended, whatever the configuration says. Freezing a session daemon does
+not merely pause it: every client making a synchronous D-Bus call to a well-known name it owns blocks
+on a 25-second timeout, and the bus cannot activate a replacement while the name is held. Freezing a
+modal dialog hangs whatever is waiting for the user's answer — a frozen `pinentry` hangs GPG and the
+SSH agent.
+
+The list is compiled in, **takes precedence over your rules**, and cannot be disabled:
+
+```
+xdg-desktop-portal*, xdg-document-portal, xdg-permission-store,
+dbus-daemon, dbus-broker, pipewire, pipewire-pulse, wireplumber, pulseaudio,
+gvfsd*, gnome-keyring-daemon, at-spi-bus-launcher, at-spi2-registryd,
+ibus-daemon, fcitx5, dconf-service, polkit-*, elogind, systemd*,
+zenity, yad, kdialog, xmessage, pinentry*, ssh-askpass*,
+polkit-gnome-authentication-agent-1, lxpolkit, gcr-prompter
+```
+
+As a second line of defence, any process owning a well-known name on the session bus is also spared.
+That check costs a little bus traffic and can be turned off with `defaults.protection.dbus_check`.
+
+Applications covered by either rule appear as `PROTECTED` in `app-powerd list`, with the reason in
+the `RULE` column, and are counted in `app-powerd status`. If a rule of yours appears to be ignored,
+this is the first thing to check.
+
+## Logging
+
+The daemon logs to stderr and does not manage a log file itself; colour is used only when a terminal
+is attached. Configure rotation externally, for example with logrotate:
+
+```
+# ~/.config/logrotate/app-powerd
+/home/YOU/.local/state/log/app-powerd.log {
+    size 10M
+    rotate 3
+    copytruncate
+    missingok
+    notifempty
+}
+```
+
+Verbosity follows `RUST_LOG` (`RUST_LOG=debug app-powerd run`). Expected conditions — a process that
+exited before a signal reached it, a partially applied operation — are logged at `debug`, and
+repeated warnings about the same process are suppressed for five minutes; `warns_suppressed` in
+`app-powerd stats` counts what was withheld.
+
 ## systemd Integration
 
 Create `~/.config/systemd/user/app-powerd.service`:
@@ -416,6 +508,35 @@ engine.run().await;
 ```
 
 See the [API documentation](https://docs.rs/app-powerd-core) for details.
+
+## Breaking changes in 2.0.0
+
+**Upgrading.** The 1.x daemon does not write a freeze journal, so processes it has already suspended
+are unknown to the new binary. Release them before switching:
+
+```bash
+# 1. stop the old daemon, then resume whatever it left stopped
+ps -eo pid,stat --no-headers | awk '$2 ~ /T/ {print $1}' | xargs -r kill -CONT
+# 2. install the new binary and start it
+```
+
+**Rolling back to 1.x.** Run `app-powerd thaw-all` with the 2.x binary first, then remove
+`$XDG_RUNTIME_DIR/app-powerd/frozen.json` — 1.x neither reads nor cleans it up.
+
+**IPC protocol.** Bumped to v2 and reported in `app-powerd status`. `Freeze`/`Thaw` now take a target
+that is either a PID or an application name; the 1.x PID-only wire form is still accepted for one
+release, so a 2.x CLI keeps working against a not-yet-restarted 1.x daemon. A request that cannot be
+decoded now gets an explicit `protocol mismatch` reply instead of a closed socket.
+
+**Configuration.** Two additive fields, both optional: `defaults.reconcile_interval` (default `30s`)
+and `defaults.protection.dbus_check` (default `true`). Existing configs load unchanged. Name matching
+in rules is now case-insensitive, which can make a rule match windows it previously missed.
+
+**Library API** (`app-powerd-core`). `AppId` gained a case-folded identity and is no longer a tuple
+struct; `AppEntry::pids` returns `Vec<u32>` rather than a slice, and `add_pid` takes and validates a
+real PID. Freeze, thaw and throttle return an `ApplyReport` describing each process's outcome instead
+of a single `Result`. `Engine::with_journal` is the constructor to use when persistence is wanted;
+`Engine::new` keeps the journal disabled.
 
 ## License
 

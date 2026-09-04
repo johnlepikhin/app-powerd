@@ -10,6 +10,16 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 
+# On stop the daemon resumes every process it suspended before exiting. That is
+# not optional work: SIGSTOP cannot be undone by the stopped process, so being
+# killed part-way leaves them stranded. Give it room to finish.
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# The freeze journal lives in $XDG_RUNTIME_DIR/app-powerd/, covered by
+# ReadWritePaths=%t below. It records what is suspended so a crashed daemon's
+# victims can be resumed on the next start.
+
 # Environment
 Environment=RUST_LOG=info
 
