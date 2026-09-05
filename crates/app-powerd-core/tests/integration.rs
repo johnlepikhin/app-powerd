@@ -1522,6 +1522,79 @@ async fn an_app_owning_a_bus_name_is_still_managed() {
     let _ = std::fs::remove_dir_all(journal_path.parent().unwrap());
 }
 
+/// With management disabled, losing focus must still be recorded.
+///
+/// Withholding the `Background` state left every application `Active` forever,
+/// so each later focus change reported all of them as newly backgrounded again.
+/// On AC — where management is off all day — that produced thousands of
+/// identical log lines: 1619 of them against 733 real focus changes on the
+/// reference machine.
+#[tokio::test]
+async fn backgrounding_is_recorded_even_when_management_is_off() {
+    let config: Config = serde_yaml_ng::from_str(
+        r#"
+version: 1
+defaults:
+  enabled: true
+  reconcile_interval: "50ms"
+  protection:
+    dbus_check: false
+  mode:
+    ac: disable
+    battery: enable
+  timing:
+    suspend_delay: "50ms"
+    resume_grace: "10ms"
+    min_suspend: "10ms"
+"#,
+    )
+    .unwrap();
+    let (engine, tx) = Engine::new(config, std::path::PathBuf::from("/tmp/test-config.yaml"))
+        .expect("engine init");
+    let engine_handle = tokio::spawn(engine.run());
+
+    // On AC with `ac: disable`, nothing is managed.
+    tx.send(EngineEvent::PowerSourceChanged(PowerSource::Ac))
+        .await
+        .unwrap();
+
+    let first = TestProc::spawn();
+    let second = TestProc::spawn();
+
+    tx.send(EngineEvent::FocusChanged(make_window(
+        1,
+        first.pid(),
+        "First",
+    )))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    tx.send(EngineEvent::FocusChanged(make_window(
+        2,
+        second.pid(),
+        "Second",
+    )))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let apps = query_app_list(&tx).await;
+    let first_info = apps.iter().find(|a| a.app_id == "First").unwrap();
+    assert_eq!(
+        first_info.state,
+        AppState::Background,
+        "an unfocused app must be recorded as Background even with management off"
+    );
+    // And it must not be suspended: management is off.
+    assert!(!is_stopped(first.pid()));
+
+    let second_info = apps.iter().find(|a| a.app_id == "Second").unwrap();
+    assert_eq!(second_info.state, AppState::Active);
+
+    tx.send(EngineEvent::Shutdown).await.unwrap();
+    engine_handle.await.unwrap();
+}
+
 /// Switching to AC with `ac: disable` must resume everything.
 ///
 /// Regression cover for the interaction the report asked us to verify, and for

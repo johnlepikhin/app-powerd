@@ -21,8 +21,20 @@ impl Engine {
         procs: &[ProcessHandle],
     ) {
         if !self.should_manage() && action.requires_management() {
-            // Management is off, so nothing was applied. Recording the target
-            // state anyway would be a lie the rest of the engine acts on.
+            // Management is off: no process is touched and no timer is worth
+            // starting. The bookkeeping state must still move, though —
+            // `Background` claims nothing about any process, and withholding it
+            // leaves the application `Active` forever, so every later focus
+            // change re-reports it as newly backgrounded. On AC that turned
+            // into thousands of identical log lines.
+            //
+            // `Frozen` and `Throttled` are withheld: those would assert that a
+            // process was suspended when none was.
+            if !matches!(new_state, AppState::Frozen | AppState::Throttled) {
+                if let Some(entry) = self.registry.get_mut(app_id) {
+                    entry.set_state(new_state);
+                }
+            }
             debug!(app_id = %app_id, "management disabled, skipping action");
             return;
         }
